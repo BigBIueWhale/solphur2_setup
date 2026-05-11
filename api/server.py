@@ -610,23 +610,48 @@ class GenerateRequest(BaseModel):
         description="If null, a fresh 63-bit random seed is generated.",
     )
     duration_seconds: float = Field(
-        20.0,
+        10.0,
         ge=1.0,
         le=20.0,
         description=(
-            "Output duration in seconds. Hard-capped at 20.0 — Lightricks' "
-            "validated training-distribution maximum for LTX-2.3 "
-            "(arXiv:2601.03233 §6.3 + docs.ltx.video/models). Frame count is "
-            "round(duration*fps) snapped to the nearest 8n+1."
+            "Output duration in seconds. Default 10.0 matches Sulphur's "
+            "shipped workflow (241 frames @ 24 fps ≈ 10.04 s) — the Sulphur "
+            "maintainer's empirically tested operating point. Hard-capped at "
+            "20.0, which is the LTX-2.3 base ceiling (arXiv:2601.03233 §6.3) "
+            "but is OUT-OF-DISTRIBUTION for the Sulphur fine-tune. Requesting "
+            ">10 s logs a warning. Frame count is round(duration*fps) snapped "
+            "to the nearest 8n+1."
         ),
     )
-    width: int = Field(1920, ge=512, le=1920, description="Multiple of 32.")
-    height: int = Field(1088, ge=320, le=1088, description="Multiple of 32.")
+    width: int = Field(
+        1280,
+        ge=512,
+        le=1920,
+        description=(
+            "Multiple of 32. Default 1280 matches Sulphur's shipped workflow "
+            "effective output width (after the maintainer's 1366-snap-to-mod-32, "
+            "stage-2 lands at 1344×768 ≈ 720p). 1920 is permitted (LTX-2.3 "
+            "1080p) but pushes Sulphur's stage-1 transformer to 2× the area "
+            "it was tested at. Requesting >1280 logs a warning."
+        ),
+    )
+    height: int = Field(
+        704,
+        ge=320,
+        le=1088,
+        description=(
+            "Multiple of 32. Default 704 with width=1280 gives clean 16:9 at "
+            "~720p — the same megapixel class Sulphur was tested at. 1088 is "
+            "permitted up to the LTX-2.3 1080p ceiling."
+        ),
+    )
     fps: int = Field(
         24,
         description=(
-            "Frame rate. 24/25 fps unlocks the full 20-second ceiling. "
-            "48/50 fps caps duration at 10 s per Lightricks' API matrix."
+            "Frame rate. 24 matches Sulphur's shipped workflow. 25 is also "
+            "within the Musubi-tuner training defaults for LTX-2.3. 48/50 fps "
+            "caps duration at 10 s per Lightricks' API matrix and is OOD for "
+            "Sulphur."
         ),
     )
     mode: str = Field(
@@ -901,6 +926,34 @@ async def generate(req: GenerateRequest) -> FileResponse:
         seed,
         req.enhance_prompt,
     )
+
+    # Out-of-distribution warnings for Sulphur fine-tune (NOT LTX-2.3 base).
+    # Sulphur's shipped workflow targets 1344×768 stage-2 × 241 frames @ 24 fps
+    # (~720p × 10 s). Anything beyond is within LTX-2.3's documented envelope
+    # but unproven on the Sulphur fine-tune specifically.
+    if width > 1344 or height > 768:
+        log.warning(
+            "OOD-Sulphur: requested %dx%d exceeds Sulphur's shipped workflow "
+            "target of 1344x768 (~720p). LTX-2.3 base supports up to 1920x1088 "
+            "but the Sulphur fine-tune was not verified at this size by the "
+            "maintainer. Quality may degrade vs the tested envelope.",
+            width, height,
+        )
+    if frames > 241:
+        log.warning(
+            "OOD-Sulphur: requested %d frames (%.2fs @ %d fps) exceeds "
+            "Sulphur's shipped 241 frames (~10s @ 24 fps). The fine-tune was "
+            "tuned for long-clip motion coherence but tested at 241; longer "
+            "clips may show temporal drift.",
+            frames, frames / req.fps, req.fps,
+        )
+    if req.fps not in (24, 25):
+        log.warning(
+            "OOD-Sulphur: fps=%d is outside Sulphur's shipped 24 fps and "
+            "Musubi-tuner training default of 24-25 fps. Motion timing may "
+            "be off-distribution.",
+            req.fps,
+        )
 
     client_id = uuid.uuid4().hex
 

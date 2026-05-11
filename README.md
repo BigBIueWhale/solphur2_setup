@@ -15,21 +15,41 @@ Target hardware (validated 2026-05-11):
 - Ubuntu 24.04.3 LTS (Noble Numbat)
 - 64 GiB system RAM, 8 GiB swap
 
-Capability ceiling on this hardware:
+### Two envelopes — the Sulphur tested envelope vs. the LTX-2.3 base ceiling
 
-- **1920 × 1088 × 481 frames @ 24 fps (1080p × 20 s)** in `fast` mode (Sulphur's
-  shipped 6+3-step distilled two-stage workflow with the FP8 mixed checkpoint).
-  Peak ~26.2 GiB VRAM, ~7 minutes (measured 433s on Test A) per video (measured on this exact hardware
-  with the canonical two-stage half-resolution-base + x2-spatial-upsample +
-  refine pipeline; leaves ~6 GiB of VRAM headroom for further quality
-  improvements like FP16 SageAttention and BF16 Gemma3).
-- The same envelope in `quality` mode (no distill LoRA, 25-step full sampling)
-  takes ~14 minutes and produces marginally higher detail at the cost of
-  stochastic regression on motion coherence.
+The video model is a **fine-tune of LTX-2.3-22B** by SulphurAI. LTX-2.3 base
+supports up to 1080p × 20s × 24fps; the Sulphur fine-tune was tested on a
+smaller envelope. Two distinct numbers therefore apply:
 
-This is Lightricks' documented Fast/1080p maximum (`arXiv:2601.03233` §6.3
-and `docs.ltx.video/models`). The model's audio-visual training distribution
-caps at 20 seconds; longer outputs require I2V chaining.
+**Sulphur's tested envelope (the production default)** — what the maintainer
+shipped and verified:
+
+- **1280 × 704 × 241 frames @ 24 fps (≈720p × 10 s)** — Sulphur's shipped
+  `workflows/ltx23_t2v distilled.json` runs stage-2 at 1344×768 × 241 frames;
+  our 1280×704 lands within the same megapixel class with a cleaner 16:9
+  mod-32 aspect.
+- Peak ~25 GiB VRAM, ~2 minutes per video on the RTX 5090 (measured Test A
+  smoke at 1280×704×113f = 126s; 10s clip scales to ~2-3 minutes).
+- This is the **default** the API returns when the caller doesn't override.
+
+**LTX-2.3 base ceiling (opt-in via larger request fields)** — what the
+underlying architecture allows but the Sulphur fine-tune was NOT verified at:
+
+- **1920 × 1088 × 481 frames @ 24 fps (1080p × 20 s)** in `fast` mode,
+  ~26.2 GiB peak VRAM, ~7 min wall-clock (measured Test A headline).
+- Same envelope in `quality` mode (no distill LoRA, 50-step LTXVScheduler):
+  same VRAM peak, ~14 min wall-clock (measured Test B).
+- The API will accept requests up to this ceiling. The server logs
+  `OOD-Sulphur` warnings when the request exceeds Sulphur's shipped
+  envelope, so quality regressions are observable in the logs.
+
+Why this two-tier design: per a dedicated sub-agent research pass, Sulphur's
+training data and tested operating point are around `~1024×576 × 25-125
+frames @ 24/25 fps` (inferred from the maintainer's shipped workflow + the
+Musubi-tuner LTX-2.3 community standard bucket + TenStrip's 10Eros sister
+model). 1920×1088 × 481 frames is 2× the stage-1 area and 2× the frame
+count the fine-tune was tested at — within LTX-2.3 native, but out-of-
+distribution for Sulphur.
 
 ## Architecture
 
@@ -74,8 +94,15 @@ trip. Endpoint:
 ```
 POST http://127.0.0.1:8000/generate
 Content-Type: application/json
-{ "prompt": "<free text>", "duration_seconds": 20 }
-# (mode defaults to "quality"; pass "mode":"fast" only if you want the ~7 min distilled path)
+{ "prompt": "<free text>" }
+# Server-side defaults: 1280×704 × 10s @ 24fps in quality mode (Sulphur's
+# tested envelope). Override per request to opt up to the LTX-2.3 ceiling
+# (1920×1088 × 20s) — the API will log an OOD-Sulphur warning since
+# Sulphur was not verified at the larger envelope.
+# Override examples:
+#   {"prompt": "...", "duration_seconds": 20}                  ← LTX-2.3 max duration
+#   {"prompt": "...", "width": 1920, "height": 1088}           ← LTX-2.3 max resolution
+#   {"prompt": "...", "mode": "fast"}                          ← speed over quality
 → 200 OK
   Content-Type: video/mp4
   <MP4 bytes>
@@ -139,7 +166,7 @@ To actually generate a video against a live stack:
 ```bash
 curl -fsS -X POST http://127.0.0.1:8000/generate \
     -H 'Content-Type: application/json' \
-    -d '{"prompt":"a cinematic close-up of a foggy cobblestone alley at dawn", "duration_seconds":20}' \
+    -d '{"prompt":"a cinematic close-up of a foggy cobblestone alley at dawn"}' \
     --output ~/Videos/headline.mp4
 ```
 
