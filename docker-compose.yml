@@ -1,0 +1,162 @@
+# solphur2 — single-host, three-service compose stack on the loopback only.
+#
+# Run from the project root:
+#     docker compose --env-file versions.env up -d --build
+#
+# All inbound surfaces map only to 127.0.0.1 on the host — no 0.0.0.0.
+# Inter-service traffic stays inside the `solphur2net` bridge.
+
+name: solphur2
+
+x-build-args: &build-args
+  CUDA_BASE_IMAGE: ${CUDA_BASE_IMAGE}
+  PYTHON_VERSION: ${PYTHON_VERSION}
+  PYTORCH_INDEX_URL: ${PYTORCH_INDEX_URL}
+  TORCH_VERSION: ${TORCH_VERSION}
+  TORCHVISION_VERSION: ${TORCHVISION_VERSION}
+  TORCHAUDIO_VERSION: ${TORCHAUDIO_VERSION}
+  TRITON_VERSION: ${TRITON_VERSION}
+  COMFYUI_REPO: ${COMFYUI_REPO}
+  COMFYUI_REF: ${COMFYUI_REF}
+  COMFYUI_SHA: ${COMFYUI_SHA}
+  LTXVIDEO_NODES_REPO: ${LTXVIDEO_NODES_REPO}
+  LTXVIDEO_NODES_SHA: ${LTXVIDEO_NODES_SHA}
+  KJNODES_REPO: ${KJNODES_REPO}
+  KJNODES_REF: ${KJNODES_REF}
+  KJNODES_SHA: ${KJNODES_SHA}
+  COMFYMATH_REPO: ${COMFYMATH_REPO}
+  COMFYMATH_SHA: ${COMFYMATH_SHA}
+  SAGEATTENTION_REPO: ${SAGEATTENTION_REPO}
+  SAGEATTENTION_REF: ${SAGEATTENTION_REF}
+  SAGEATTENTION_SHA: ${SAGEATTENTION_SHA}
+  TRANSFORMERS_VERSION: ${TRANSFORMERS_VERSION}
+  DIFFUSERS_VERSION: ${DIFFUSERS_VERSION}
+  ACCELERATE_VERSION: ${ACCELERATE_VERSION}
+  SAFETENSORS_VERSION: ${SAFETENSORS_VERSION}
+  EINOPS_VERSION: ${EINOPS_VERSION}
+  KORNIA_VERSION: ${KORNIA_VERSION}
+  NINJA_VERSION: ${NINJA_VERSION}
+  HUGGINGFACE_HUB_VERSION: ${HUGGINGFACE_HUB_VERSION}
+  LLAMACPP_REPO: ${LLAMACPP_REPO}
+  LLAMACPP_REF: ${LLAMACPP_REF}
+  LLAMACPP_SHA: ${LLAMACPP_SHA}
+  FASTAPI_VERSION: ${FASTAPI_VERSION}
+  UVICORN_VERSION: ${UVICORN_VERSION}
+  HTTPX_VERSION: ${HTTPX_VERSION}
+
+services:
+
+  comfyui:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.comfyui
+      args: *build-args
+    image: solphur2/comfyui:${COMFYUI_REF}
+    container_name: solphur2-comfyui
+    # nvidia-container-toolkit 1.19.0 — already on the host per personal_server README.
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # PyTorch CUDA allocator tuning — keep allocation fragmentation low on
+      # the 32 GiB RTX 5090. expandable_segments improves headroom near VRAM cap.
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,garbage_collection_threshold:0.9"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      # Models bind-mount — populated by scripts/download_models.sh on the host.
+      # Read-only so the container cannot corrupt the SHA-256-verified copies.
+      - ./models:/models:ro
+      # Output bind-mount — generated MP4s persist on the host.
+      - ./outputs:/outputs:rw
+    ports:
+      # Host loopback only. Other compose services reach this via DNS as
+      # http://comfyui:8188 over the internal bridge network.
+      - "127.0.0.1:8188:8188"
+    networks:
+      - solphur2net
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "curl -fsS http://127.0.0.1:8188/system_stats >/dev/null"
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 180s
+    restart: unless-stopped
+    # The Sulphur FP8 mixed checkpoint is 27.16 GiB; allow some swap headroom.
+    # The compose host (Ubuntu 24.04) carries 8 GiB swap by default.
+    shm_size: 2g
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+
+  enhancer:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.enhancer
+      args: *build-args
+    image: solphur2/enhancer:${LLAMACPP_REF}
+    container_name: solphur2-enhancer
+    # Intentionally NO `runtime: nvidia` — this container is CPU-only, leaving
+    # all 32607 MiB of VRAM for ComfyUI.
+    volumes:
+      # The prompt-enhancer container only needs the prompt_enhancer/ subtree.
+      # Mount that specific subdir so it can't see the video model checkpoints.
+      - ./models/prompt_enhancer:/models:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      - solphur2net
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "curl -fsS http://127.0.0.1:8080/health >/dev/null"
+      interval: 10s
+      timeout: 3s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+    # llama.cpp with 8K context + Q8 Qwen3-VL: ~10 GiB of system RAM.
+    mem_limit: 16g
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+      args: *build-args
+    image: solphur2/api:1.0.0
+    container_name: solphur2-api
+    environment:
+      COMFYUI_URL: "http://comfyui:8188"
+      ENHANCER_URL: "http://enhancer:8080"
+      OUTPUTS_DIR: "/outputs"
+    volumes:
+      # The API container needs read access to the OUTPUTS volume to serve
+      # the generated MP4 via FileResponse.
+      - ./outputs:/outputs:ro
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      comfyui:
+        condition: service_healthy
+      enhancer:
+        condition: service_healthy
+    networks:
+      - solphur2net
+    restart: unless-stopped
+
+networks:
+  solphur2net:
+    # `internal: false` so containers can still hit huggingface.co for any
+    # runtime cache miss (HF Hub is sometimes consulted by transformers even
+    # when local model paths are passed). Inbound from the world is impossible
+    # because no service exposes a port outside 127.0.0.1.
+    driver: bridge
+    name: solphur2net

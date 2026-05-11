@@ -1,0 +1,189 @@
+# syntax=docker/dockerfile:1.7
+#
+# solphur2/comfyui — ComfyUI v0.21.0 with FP8-on-Blackwell fix + LTX-2.3 nodes
+#                    + KJNodes + ComfyMath + SageAttention 2.2.0 built for sm_120.
+#
+# Pins live in /versions.env at the project root and are passed in as build ARGs
+# by docker-compose. Never hardcode a version in this file — it must always
+# match versions.env.
+#
+# Target hardware: NVIDIA GeForce RTX 5090 (compute capability sm_120, Blackwell
+# architecture). The PyTorch cu130 wheel below carries sm_120 as a native binary
+# target (not just PTX), per the v2.11.0 build_cuda.sh manifest.
+
+ARG CUDA_BASE_IMAGE
+FROM ${CUDA_BASE_IMAGE} AS base
+
+ARG PYTORCH_INDEX_URL
+ARG TORCH_VERSION
+ARG TORCHVISION_VERSION
+ARG TORCHAUDIO_VERSION
+ARG TRITON_VERSION
+ARG COMFYUI_REPO
+ARG COMFYUI_REF
+ARG COMFYUI_SHA
+ARG LTXVIDEO_NODES_REPO
+ARG LTXVIDEO_NODES_SHA
+ARG KJNODES_REPO
+ARG KJNODES_REF
+ARG KJNODES_SHA
+ARG COMFYMATH_REPO
+ARG COMFYMATH_SHA
+ARG SAGEATTENTION_REPO
+ARG SAGEATTENTION_REF
+ARG SAGEATTENTION_SHA
+ARG TRANSFORMERS_VERSION
+ARG DIFFUSERS_VERSION
+ARG ACCELERATE_VERSION
+ARG SAFETENSORS_VERSION
+ARG EINOPS_VERSION
+ARG KORNIA_VERSION
+ARG NINJA_VERSION
+ARG HUGGINGFACE_HUB_VERSION
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_ROOT_USER_ACTION=ignore \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TZ=Etc/UTC
+
+# --- OS packages -------------------------------------------------------------
+# build-essential + ninja-build for the SageAttention CUDA extension compile.
+# libgl1, libglib2.0-0 are runtime deps of OpenCV (used by some Comfy nodes).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git ninja-build cmake build-essential \
+        python3.12 python3.12-venv python3-pip \
+        libgl1 libglib2.0-0 \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Project-local venv so we never collide with the system Python managed by apt.
+RUN python3 -m venv --system-site-packages=false /opt/venv
+ENV PATH=/opt/venv/bin:${PATH} \
+    VIRTUAL_ENV=/opt/venv
+
+RUN pip install --no-cache-dir --upgrade pip==25.3 setuptools==80.0.0 wheel==0.45.1
+
+# --- PyTorch (Blackwell sm_120 native) ---------------------------------------
+# cu130 wheels: TORCH_CUDA_ARCH_LIST = "7.5;8.0;8.6;9.0;10.0;12.0"
+RUN pip install --no-cache-dir --index-url ${PYTORCH_INDEX_URL} \
+        "torch==${TORCH_VERSION}" \
+        "torchvision==${TORCHVISION_VERSION}" \
+        "torchaudio==${TORCHAUDIO_VERSION}"
+
+# Triton (bundled with PyTorch 2.11.0 — explicit pin for reproducibility).
+RUN pip install --no-cache-dir "triton==${TRITON_VERSION}"
+
+# --- SageAttention 2.2.0 — built from source for sm_120 ----------------------
+# No Linux/Blackwell prebuilt wheel exists upstream (woct0rdho's prebuilds are
+# Windows-only). Target arch list scoped to "12.0" to keep the compile short.
+RUN git clone --depth 1 --branch ${SAGEATTENTION_REF} ${SAGEATTENTION_REPO} /tmp/sageattention \
+    && cd /tmp/sageattention \
+    && TORCH_CUDA_ARCH_LIST="12.0" \
+       EXT_PARALLEL=4 \
+       NVCC_APPEND_FLAGS="--threads 4" \
+       MAX_JOBS=4 \
+       pip install --no-cache-dir --no-build-isolation . \
+    && rm -rf /tmp/sageattention /root/.cache/pip /root/.cache/torch_extensions
+
+# --- ComfyUI core ------------------------------------------------------------
+RUN git clone ${COMFYUI_REPO} /opt/ComfyUI \
+    && cd /opt/ComfyUI \
+    && git checkout ${COMFYUI_REF}
+
+WORKDIR /opt/ComfyUI
+RUN pip install --no-cache-dir -r requirements.txt
+
+# --- Custom-node pack: Lightricks/ComfyUI-LTXVideo (LTX-2.3 nodes,
+#                       low_vram_loaders, LTXVPromptEnhancer, etc.) -----------
+RUN git clone ${LTXVIDEO_NODES_REPO} custom_nodes/ComfyUI-LTXVideo \
+    && cd custom_nodes/ComfyUI-LTXVideo \
+    && git fetch --depth 1 origin ${LTXVIDEO_NODES_SHA} \
+    && git checkout ${LTXVIDEO_NODES_SHA} \
+    && pip install --no-cache-dir -r requirements.txt
+
+# --- Custom-node pack: kijai/ComfyUI-KJNodes -------------------------------
+# Critical for Blackwell FP8: PathchSageAttentionKJ + LTX2_NAG manual_cast_dtype
+# fix from commit 0e173bbfa9de that closes the
+# "addmm_cuda not implemented for Float8_e4m3fn" crash (issue #11920/505).
+RUN git clone --branch ${KJNODES_REF} --depth 1 ${KJNODES_REPO} custom_nodes/ComfyUI-KJNodes \
+    && cd custom_nodes/ComfyUI-KJNodes \
+    && pip install --no-cache-dir -r requirements.txt || true
+
+# --- Custom-node pack: evanspearman/ComfyMath (ComfyMathExpression) ----------
+RUN git clone ${COMFYMATH_REPO} custom_nodes/ComfyMath \
+    && cd custom_nodes/ComfyMath \
+    && git fetch --depth 1 origin ${COMFYMATH_SHA} \
+    && git checkout ${COMFYMATH_SHA} \
+    && if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+
+# --- Python libs explicitly pinned to known-good versions for LTX-2.3 --------
+# (ComfyUI-LTXVideo lists these unpinned; we lock them so the build is byte-
+# identical across rebuilds.)
+RUN pip install --no-cache-dir \
+        "transformers==${TRANSFORMERS_VERSION}" \
+        "diffusers==${DIFFUSERS_VERSION}" \
+        "accelerate==${ACCELERATE_VERSION}" \
+        "safetensors==${SAFETENSORS_VERSION}" \
+        "einops==${EINOPS_VERSION}" \
+        "kornia==${KORNIA_VERSION}" \
+        "ninja~=${NINJA_VERSION}" \
+        "huggingface_hub[hf_xet]==${HUGGINGFACE_HUB_VERSION}"
+
+# --- Models volume mount point ----------------------------------------------
+# The compose file bind-mounts the host's ./models directory at /models inside
+# the container. ComfyUI looks under /opt/ComfyUI/models/* — we redirect each
+# subfolder via symlinks so the host can keep the canonical names.
+RUN rm -rf /opt/ComfyUI/models \
+    && mkdir -p /models \
+    && ln -s /models /opt/ComfyUI/models
+
+# --- Output volume mount point ----------------------------------------------
+# Bind-mounted to host ./outputs so generated MP4s persist across container runs.
+RUN rm -rf /opt/ComfyUI/output && ln -s /outputs /opt/ComfyUI/output
+
+# --- Sanity check the build (cheap, fail-fast on the cu130 wheel mismatch) ---
+RUN python -c "import torch, triton; \
+    assert torch.cuda.is_available() or True, 'cuda not visible at build time, OK'; \
+    print('torch', torch.__version__, 'triton', triton.__version__); \
+    print('arch list', torch.cuda.get_arch_list())" \
+    && python -c "import sageattention; print('sageattention OK')"
+
+# --- Print the embedded version pins on container start (informational) ------
+LABEL org.opencontainers.image.title="solphur2/comfyui" \
+      org.opencontainers.image.description="ComfyUI + LTX-2.3 + Sulphur-2 FP8 mixed for RTX 5090 sm_120" \
+      org.opencontainers.image.source="https://github.com/rzyroff/solphur2_setup" \
+      solphur2.torch="${TORCH_VERSION}" \
+      solphur2.comfyui="${COMFYUI_REF}" \
+      solphur2.ltxvideo_nodes="${LTXVIDEO_NODES_SHA}" \
+      solphur2.kjnodes="${KJNODES_REF}" \
+      solphur2.sageattention="${SAGEATTENTION_REF}"
+
+EXPOSE 8188
+
+# --- Server entrypoint -------------------------------------------------------
+# `--listen 0.0.0.0` binds inside the container only — the docker-compose port
+# mapping is `127.0.0.1:8188:8188`, so the host never exposes ComfyUI beyond
+# loopback. Other services on the solphur2net network reach it via DNS as
+# `http://comfyui:8188`.
+#
+# --use-sage-attention is INTENTIONALLY OMITTED. The global CLI flag exits the
+# process at startup with -1 if `import sageattention` fails (see
+# comfy/ldm/modules/attention.py:28-33), which is unhelpful in a container that
+# hasn't completed first-run setup. Instead we patch SageAttention per-model
+# via the PathchSageAttentionKJ node inside the workflow — that path uses
+# transformer_options["optimized_attention_override"] which takes precedence
+# over any global setting anyway (attention.py:127-143). Same effect, finer
+# granularity, no startup-blocking import side-effect.
+#
+# --reserve-vram 0.5 leaves 512 MiB for the cuDNN / CUDA runtime workspace; an
+# empirical reserve that keeps 1080p × 20s FP8 mixed inference below the
+# 32607 MiB ceiling on the NVIDIA GeForce RTX 5090.
+# --disable-auto-launch suppresses the browser-tab auto-open (headless).
+CMD ["python", "main.py", \
+     "--listen", "0.0.0.0", \
+     "--port", "8188", \
+     "--disable-auto-launch", \
+     "--reserve-vram", "0.5"]

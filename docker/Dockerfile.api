@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1.7
+#
+# solphur2/api — single-file FastAPI gateway: enhance prompt → run ComfyUI
+# workflow → return a single MP4 file.
+
+ARG PYTHON_VERSION
+FROM python:${PYTHON_VERSION}-slim-bookworm AS api
+
+ARG FASTAPI_VERSION
+ARG UVICORN_VERSION
+ARG HTTPX_VERSION
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Minimal runtime: curl for healthchecks; everything else is Python.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install \
+        "fastapi[standard]==${FASTAPI_VERSION}" \
+        "uvicorn[standard]==${UVICORN_VERSION}" \
+        "httpx==${HTTPX_VERSION}" \
+        "python-multipart==0.0.20" \
+        "websockets==15.0.1"
+
+WORKDIR /app
+# server.py is fully self-contained: the workflow definition is built
+# programmatically inside `_build_workflow()`, no template JSON file required.
+COPY api/server.py /app/server.py
+
+LABEL org.opencontainers.image.title="solphur2/api" \
+      org.opencontainers.image.description="solphur2 FastAPI gateway (single-file generate endpoint)"
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=10s --timeout=3s --retries=10 --start-period=15s \
+    CMD curl -fsS http://127.0.0.1:8000/healthz || exit 1
+
+# Bind 0.0.0.0 inside container; the compose mapping is `127.0.0.1:8000:8000`
+# so the host's loopback is the only external surface.
+CMD ["uvicorn", "server:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--workers", "1", \
+     "--access-log", \
+     "--log-level", "info"]

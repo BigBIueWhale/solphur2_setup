@@ -1,0 +1,106 @@
+# syntax=docker/dockerfile:1.7
+#
+# solphur2/enhancer — CPU-only llama.cpp server hosting the Sulphur prompt
+# enhancer model (Qwen3-VL-based, Q8_0 GGUF + BF16 multimodal projector).
+#
+# Why CPU-only:
+#   • The Sulphur-2-base FP8 mixed video transformer needs ~30 GiB of the
+#     RTX 5090's 32607 MiB VRAM during generation. Sharing the GPU with a
+#     ~10 GiB GGUF would force ComfyUI into weight-streaming and triple
+#     end-to-end latency.
+#   • Prompt enhancement is a one-shot text rewrite per video — a few seconds
+#     on modern CPUs is fine for an offline-style API.
+#   • Keeping this container GPU-free also means it can be restarted, scaled,
+#     or moved to a different host without touching nvidia-container-toolkit.
+
+ARG LLAMACPP_REPO
+ARG LLAMACPP_REF
+ARG LLAMACPP_SHA
+
+# ---- Build stage ------------------------------------------------------------
+FROM ubuntu:24.04 AS builder
+
+ARG LLAMACPP_REPO
+ARG LLAMACPP_REF
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git cmake build-essential \
+        libcurl4-openssl-dev libopenblas-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 --branch ${LLAMACPP_REF} ${LLAMACPP_REPO} /opt/llama.cpp
+
+WORKDIR /opt/llama.cpp
+
+# Build flags:
+#   GGML_NATIVE=OFF        — no -march=native (image must run on any x86_64).
+#   GGML_CUDA=OFF          — CPU only; no CUDA dependency at runtime.
+#   GGML_BLAS=ON           — use OpenBLAS for matmul (fast on modern Xeons/Ryzens).
+#   GGML_BLAS_VENDOR=OpenBLAS — explicit pick to avoid linking ATLAS or MKL.
+#   LLAMA_CURL=ON          — enables HTTP model auto-download in llama-server.
+#   BUILD_SHARED_LIBS=OFF  — fully static binary (smaller runtime image).
+#   LLAMA_BUILD_TESTS=OFF  — skip GGML unit tests.
+#   LLAMA_BUILD_EXAMPLES=OFF — we only want llama-server, not the examples.
+RUN cmake -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_NATIVE=OFF \
+        -DGGML_CUDA=OFF \
+        -DGGML_BLAS=ON \
+        -DGGML_BLAS_VENDOR=OpenBLAS \
+        -DLLAMA_CURL=ON \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+    && cmake --build build --config Release --target llama-server llama-cli -j
+
+# ---- Runtime stage ----------------------------------------------------------
+FROM ubuntu:24.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Only the bare minimum runtime libs.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libcurl4 libgomp1 libopenblas0 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
+COPY --from=builder /opt/llama.cpp/build/bin/llama-cli    /usr/local/bin/llama-cli
+
+# Models volume mount point (compose binds ./models/prompt_enhancer here).
+RUN mkdir -p /models
+
+LABEL org.opencontainers.image.title="solphur2/enhancer" \
+      org.opencontainers.image.description="Sulphur prompt enhancer (llama.cpp CPU)" \
+      solphur2.llamacpp_ref="${LLAMACPP_REF}"
+
+EXPOSE 8080
+
+# Server flags:
+#   --model / --mmproj          point at the bind-mounted GGUFs.
+#   --host 0.0.0.0 --port 8080  bind inside the container; the compose port
+#                               mapping is `127.0.0.1:8080:8080` so the host
+#                               loopback is the only external surface.
+#   -c 8192                     8K context — Sulphur's enhancer expects
+#                               <500-token input prompts, so 8K is generous.
+#   --jinja                     enable the model's bundled Jinja chat template
+#                               (Qwen3-VL ships one).
+#   -t -1                       auto-detect CPU thread count (= #physical cores).
+#   --no-context-shift          fail loud if the input exceeds context instead
+#                               of silently dropping tokens.
+#   --temp 0.7 --top-p 0.9      reasonable defaults for prompt rewriting.
+#                               The API service can override per request.
+#   --no-warmup                 skip the warmup pass (first request runs cold;
+#                               this saves ~2s on startup).
+CMD ["llama-server", \
+     "--model",   "/models/sulphur_prompt_enhancer_model-q8_0.gguf", \
+     "--mmproj",  "/models/mmproj-BF16.gguf", \
+     "--host",    "0.0.0.0", \
+     "--port",    "8080", \
+     "-c",        "8192", \
+     "--jinja", \
+     "-t",        "-1", \
+     "--no-context-shift", \
+     "--temp",    "0.7", \
+     "--top-p",   "0.9"]
