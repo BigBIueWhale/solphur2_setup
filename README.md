@@ -196,17 +196,48 @@ bash scripts/clean.sh        # remove containers + images + cache + outputs (kee
 bash scripts/clean.sh --all  # also wipe ./models/ (forces re-download next up)
 ```
 
-To actually generate a video against a live stack:
+To generate one video against a live stack, use the dedicated CLI:
 
 ```bash
-curl -fsS -X POST http://127.0.0.1:8000/generate \
-    -H 'Content-Type: application/json' \
-    -d '{"prompt":"a cinematic close-up of a foggy cobblestone alley at dawn"}' \
-    --output ~/Videos/headline.mp4
+python3 scripts/generate.py "a cinematic close-up of a foggy cobblestone alley at dawn"
 ```
 
-The default mode is **quality** (Sulphur's non-distilled 50-step pipeline, ~14 min). To prefer
-speed over quality, add `"mode":"fast"` to the request body (~7 min, distill LoRA path).
+That single invocation hits every server-side default (quality mode,
+1280×704, 10 s, 24 fps, prompt enhancer on) and writes
+`./solphur2_<random>.mp4` in ~2.5 min on RTX 5090. The script does a
+`/healthz` preflight (fails fast with a hint to run `scripts/up.sh` if
+the stack is down), streams the MP4 to a `.partial` file and atomically
+renames on success, then prints a one-line summary including the
+per-phase wall-clocks pulled from the `X-Solphur2-Phase*` response
+headers.
+
+Common variants — pass an override flag only for what you want to
+deviate from the default:
+
+```bash
+# Pick the output path:
+python3 scripts/generate.py "..." -o ~/Videos/run.mp4
+
+# Speed over quality (~half wall-clock; distill LoRA stacked on Sulphur weights):
+python3 scripts/generate.py "..." --mode fast
+
+# Maximum LTX-2.3 envelope (1080p × 20 s; logs an OOD-Sulphur warning):
+python3 scripts/generate.py "..." --width 1920 --height 1088 --duration 20
+
+# Reproducible: pass a seed:
+python3 scripts/generate.py "..." --seed 12345
+
+# Skip the enhancer (saves ~34 s; loses descriptive elaboration):
+python3 scripts/generate.py "..." --no-enhance
+```
+
+Anything you don't pass falls through to the validated server-side
+default in `api/server.py:GenerateRequest`. The script never sets a
+default of its own that could drift away from the API's defaults.
+
+The default mode is **quality** (Sulphur's non-distilled 50-step pipeline). To prefer
+speed over quality, add `--mode fast` to the invocation (or `"mode":"fast"` in raw JSON).
+See `## Resource peaks and timeline` below for measured wall-clocks per mode.
 
 ### Script reference
 
@@ -215,7 +246,8 @@ speed over quality, add `"mode":"fast"` to the request body (~7 min, distill LoR
 | `scripts/up.sh` | host check → download models (delegates to `download_models.sh`) → build (delegates to `build.sh`) → `docker compose up -d` → wait healthy | yes |
 | `scripts/build.sh [--no-cache]` | pure `docker compose build` — separated so iterations don't re-run model downloads or healthcheck waits | yes (incremental) |
 | `scripts/download_models.sh` | SHA-256-pinned model fetcher (resumable, idempotent) | yes |
-| `scripts/test.sh [--smoke-only/--headline-only/--enhance]` | end-to-end POST `/generate` round-trips. Writes MP4s to `./test_artifacts/`. | yes |
+| **`scripts/generate.py "<prompt>" [-o PATH] […]`** | **The user-facing CLI.** POSTs one `/generate` request with server-side defaults, streams the MP4 to disk atomically, prints a per-phase summary. Override flags (`--mode`, `--seed`, `--duration`, `--width`, `--height`, `--fps`, `--no-enhance`) are opt-in; anything not passed falls through to `api/server.py` defaults. | yes (each call independent) |
+| `scripts/test.sh [--smoke-only/--headline-only/--enhance]` | end-to-end POST `/generate` round-trips with hardcoded smoke + headline configs. Writes MP4s to `./test_artifacts/`. | yes |
 | `scripts/measure_default.sh "<prompt>" [--skip-build/--no-cache]` | rebuilds via `build.sh`, restarts the stack, runs ONE default-config generation, samples nvidia-smi + cgroup v2 + `/proc` at 1 Hz, prints a peak/timeline summary. The prompt is a required positional argument. Writes raw CSVs + summary to `./bench_runs/measure_default_*/`. | yes |
 | `scripts/bench.py` | binary-search sweep over (resolution × duration × mode) for empirical VRAM/time envelope | yes |
 | `scripts/down.sh` | stop + remove containers and network. Images and models survive. | yes |
@@ -532,6 +564,7 @@ solphur2_setup/
 │   ├── Dockerfile.enhancer      llama.cpp CPU build for the Sulphur prompt enhancer
 │   └── Dockerfile.api           thin FastAPI runtime
 ├── scripts/
+│   ├── generate.py              user-facing CLI: one prompt → one MP4 at server-side defaults
 │   ├── up.sh                    bring-up orchestrator
 │   ├── build.sh                 pure `docker compose build` wrapper
 │   ├── download_models.sh       SHA-256-pinned, idempotent model fetcher
