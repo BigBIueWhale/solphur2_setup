@@ -51,22 +51,47 @@ OUTPUTS_DIR = Path(os.environ.get("OUTPUTS_DIR", "/outputs"))
 
 # Model filenames (must match what scripts/download_models.sh placed under ./models/).
 SULPHUR_CKPT = "sulphur_dev_fp8mixed.safetensors"
-DISTILL_LORA = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
+DISTILL_LORA = "ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors"
 SPATIAL_UPSCALER = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 GEMMA3_TEXT_ENCODER = "gemma_3_12B_it_fp8_scaled.safetensors"
 
-# Sampling defaults — sigmas lifted verbatim from Sulphur's shipped
-# workflows/ltx23_t2v distilled.json, which the maintainer (fusioncow) tuned
-# for the FP8 mixed checkpoint.
-STAGE1_SIGMAS_FAST = "0.85, 0.7933, 0.68, 0.51, 0.2833, 0.0"   # 6 steps
-STAGE2_SIGMAS_FAST = "0.8, 0.55, 0.25, 0.0"                    # 3 steps
-# Quality mode runs the dev model without the distill LoRA, more steps.
-STAGE1_SIGMAS_QUALITY = (
-    "1.0, 0.97, 0.93, 0.89, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60, "
-    "0.55, 0.50, 0.45, 0.40, 0.35, 0.30, 0.25, 0.20, 0.15, 0.10, "
-    "0.07, 0.05, 0.03, 0.01, 0.0"
+# Per-stage distill LoRA strengths — Sulphur-canonical.
+# Sulphur applies the distill LoRA at 0.7 on stage 1 and 0.5 on stage 2.
+# TenStrip's README for the `cond_safe` LoRA family says these strengths are
+# safe ("1.0 first pass i2v / 0.4–0.5 upscale pass"); Sulphur uses 0.7 on
+# stage 1 because it also stacks an additional Sulphur LoRA in its native
+# workflow. We use a single LoRA (the full Sulphur model carries the fine-
+# tune in weights), so 0.7 stage 1 is conservative-but-faithful.
+DISTILL_LORA_STRENGTH_STAGE1 = 0.7
+DISTILL_LORA_STRENGTH_STAGE2 = 0.5
+
+# Stage-1 sigmas for "fast" mode — Lightricks' canonical DISTILLED_SIGMA_VALUES.
+# Source: LTX-2/packages/ltx-pipelines/src/ltx_pipelines/utils/constants.py
+# Also used verbatim in the official LTX-2.3_T2V_I2V_Two_Stage_Distilled.json
+# example workflow. 9 sigma values = 8 active denoising steps.
+# Sulphur's workflow uses LTXVScheduler(8, 4, 1.5, true, 0.1) — those
+# max_shift/base_shift values are outside Lightricks' documented range and
+# untested on Blackwell; we prefer the Lightricks-canonical ManualSigmas
+# path which bmgjet validated on RTX 5090.
+STAGE1_SIGMAS_FAST = (
+    "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
 )
-STAGE2_SIGMAS_QUALITY = "0.85, 0.65, 0.45, 0.25, 0.10, 0.0"
+
+# Stage-2 sigmas for "fast" mode — both Sulphur's shipped workflow (connected
+# nodes #7) AND Lightricks' canonical two-stage distilled example agree on
+# exactly these 4 values. 4 sigma values = 3 active refinement steps.
+STAGE2_SIGMAS_FAST = "0.85, 0.7250, 0.4219, 0.0"
+
+# "Quality" mode = Sulphur's non-distilled BASE workflow (ltx23_t2v base.json):
+# LTXVScheduler(50 steps, max_shift=2.72, base_shift=0.8, stretch=true,
+# terminal=0) + euler_ancestral + CFG=3.6 stage 1 / CFG=1.0 stage 2.
+# Stage-2 sigmas remain the same canonical 4-tuple.
+QUALITY_LTXVSCHEDULER_STEPS = 50
+QUALITY_LTXVSCHEDULER_MAX_SHIFT = 2.72
+QUALITY_LTXVSCHEDULER_BASE_SHIFT = 0.8
+QUALITY_LTXVSCHEDULER_TERMINAL = 0.0
+QUALITY_CFG_STAGE1 = 3.6
+QUALITY_CFG_STAGE2 = 1.0
 
 # Tiled VAE decode params for LTXVTiledVAEDecode (count-based, not pixel-based).
 # Verified inputs against Lightricks/ComfyUI-LTXVideo @229437c6 tiled_vae_decode.py:13-28:
@@ -179,8 +204,6 @@ def _build_workflow(
         return [str(node_id), slot]
 
     apply_distill_lora = (mode == "fast")
-    s1_sigmas = STAGE1_SIGMAS_FAST if apply_distill_lora else STAGE1_SIGMAS_QUALITY
-    s2_sigmas = STAGE2_SIGMAS_FAST if apply_distill_lora else STAGE2_SIGMAS_QUALITY
 
     # ---- Loaders ------------------------------------------------------------
 
@@ -189,24 +212,42 @@ def _build_workflow(
     add(
         2,
         "PathchSageAttentionKJ",
-        {"model": ref(1, 0), "sage_attention": "auto"},
+        {"model": ref(1, 0), "sage_attention": "auto", "allow_compile": False},
         "Patch SageAttention",
     )
 
     if apply_distill_lora:
+        # Per-stage distill-LoRA strengths (Sulphur-canonical: 0.7 stage 1, 0.5
+        # stage 2). Two LoraLoaderModelOnly nodes branch off the same SageAttn-
+        # patched base — ComfyUI LoRA application is additive on the model
+        # delta, so two distinct strength values require two distinct loader
+        # nodes that each feed their own CFGGuider.
         add(
             3,
             "LoraLoaderModelOnly",
             {
                 "model": ref(2, 0),
                 "lora_name": DISTILL_LORA,
-                "strength_model": 0.5,
+                "strength_model": DISTILL_LORA_STRENGTH_STAGE1,
             },
-            "Distill LoRA",
+            "Distill LoRA (Stage 1)",
         )
-        model_after_loras = ref(3, 0)
+        add(
+            7,
+            "LoraLoaderModelOnly",
+            {
+                "model": ref(2, 0),
+                "lora_name": DISTILL_LORA,
+                "strength_model": DISTILL_LORA_STRENGTH_STAGE2,
+            },
+            "Distill LoRA (Stage 2)",
+        )
+        model_stage1 = ref(3, 0)
+        model_stage2 = ref(7, 0)
     else:
-        model_after_loras = ref(2, 0)
+        # Quality mode: no distill LoRA — same model for both stages.
+        model_stage1 = ref(2, 0)
+        model_stage2 = ref(2, 0)
 
     # LTXAVTextEncoderLoader fuses the Gemma3 text encoder with the LTX-2.3
     # checkpoint so cross-attention is wired correctly. Both filenames required.
@@ -313,18 +354,44 @@ def _build_workflow(
     )
 
     # ---- Stage-1 sampling ---------------------------------------------------
-    # Official two-stage example uses euler_cfg_pp for stage-1 (deterministic).
-    add(30, "KSamplerSelect", {"sampler_name": "euler_cfg_pp"}, "Sampler 1")
-    add(31, "ManualSigmas", {"sigmas": s1_sigmas}, "Sigmas 1")
+    # Sampler choice:
+    #   • fast (distilled):    euler_ancestral_cfg_pp (Lightricks two-stage canonical, also Sulphur)
+    #   • quality (full):      euler_ancestral        (Sulphur's non-distilled base workflow)
+    # Sigma source:
+    #   • fast (distilled):    ManualSigmas with Lightricks' DISTILLED_SIGMA_VALUES
+    #   • quality (full):      LTXVScheduler(50, 2.72, 0.8, true, 0.0) — Sulphur base
+    # CFG: 1.0 for distilled (mandatory; non-1 numerically unstable),
+    #      3.6 for non-distilled (Sulphur base value).
+    if apply_distill_lora:
+        add(30, "KSamplerSelect", {"sampler_name": "euler_ancestral_cfg_pp"}, "Sampler 1")
+        add(31, "ManualSigmas", {"sigmas": STAGE1_SIGMAS_FAST}, "Sigmas 1")
+        stage1_cfg = 1.0
+    else:
+        # Quality mode uses Sulphur's canonical non-distilled base config.
+        add(30, "KSamplerSelect", {"sampler_name": "euler_ancestral"}, "Sampler 1")
+        add(
+            31,
+            "LTXVScheduler",
+            {
+                "steps": QUALITY_LTXVSCHEDULER_STEPS,
+                "max_shift": QUALITY_LTXVSCHEDULER_MAX_SHIFT,
+                "base_shift": QUALITY_LTXVSCHEDULER_BASE_SHIFT,
+                "stretch": True,
+                "terminal": QUALITY_LTXVSCHEDULER_TERMINAL,
+                "latent": ref(22, 0),
+            },
+            "LTX Scheduler 1",
+        )
+        stage1_cfg = QUALITY_CFG_STAGE1
     add(32, "RandomNoise", {"noise_seed": ref(130, 0)}, "Noise 1")
     add(
         33,
         "CFGGuider",
         {
-            "model": model_after_loras,
+            "model": model_stage1,
             "positive": ref(12, 0),
             "negative": ref(12, 1),
-            "cfg": 1.0,
+            "cfg": stage1_cfg,
         },
         "Guider 1",
     )
@@ -371,23 +438,26 @@ def _build_workflow(
     )
 
     # ---- Stage-2 sampling ---------------------------------------------------
-    add(
-        41,
-        "KSamplerSelect",
-        {"sampler_name": "euler_ancestral_cfg_pp"},
-        "Sampler 2",
-    )
-    add(42, "ManualSigmas", {"sigmas": s2_sigmas}, "Sigmas 2")
-    # noise_seed accepts INT widget value; pass int directly.
+    # Stage-2 is canonical for both fast and quality modes:
+    #   sampler        = euler_cfg_pp        (Lightricks two-stage example;
+    #                                          Sulphur ships `lcm` here but we
+    #                                          reject lcm — it's noise-prediction
+    #                                          paradigm, LTX-2 is flow-matching)
+    #   sigmas         = ManualSigmas "0.85, 0.7250, 0.4219, 0.0"
+    #                    (both Sulphur AND Lightricks agree)
+    #   cfg            = 1.0                  (both authorities)
+    #   refresh seed   = fixed value seed+1   (deterministic refine)
+    add(41, "KSamplerSelect", {"sampler_name": "euler_cfg_pp"}, "Sampler 2")
+    add(42, "ManualSigmas", {"sigmas": STAGE2_SIGMAS_FAST}, "Sigmas 2")
     add(43, "RandomNoise", {"noise_seed": int(seed) + 1}, "Noise 2")
     add(
         44,
         "CFGGuider",
         {
-            "model": model_after_loras,
+            "model": model_stage2,
             "positive": ref(12, 0),
             "negative": ref(12, 1),
-            "cfg": 1.0,
+            "cfg": QUALITY_CFG_STAGE2,  # 1.0 — same for both modes
         },
         "Guider 2",
     )

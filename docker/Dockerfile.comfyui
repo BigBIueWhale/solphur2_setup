@@ -53,14 +53,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # libgl1, libglib2.0-0 are runtime deps of OpenCV (used by some Comfy nodes).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git ninja-build cmake build-essential \
-        python3.12 python3.12-venv python3-pip \
+        python3.12 python3.12-venv python3.12-dev python3-pip \
         libgl1 libglib2.0-0 \
     && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
     && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Project-local venv so we never collide with the system Python managed by apt.
-RUN python3 -m venv --system-site-packages=false /opt/venv
+# Default behavior is `--system-site-packages` NOT set, which is what we want.
+RUN python3 -m venv /opt/venv
 ENV PATH=/opt/venv/bin:${PATH} \
     VIRTUAL_ENV=/opt/venv
 
@@ -82,8 +83,6 @@ RUN pip install --no-cache-dir "triton==${TRITON_VERSION}"
 RUN git clone --depth 1 --branch ${SAGEATTENTION_REF} ${SAGEATTENTION_REPO} /tmp/sageattention \
     && cd /tmp/sageattention \
     && TORCH_CUDA_ARCH_LIST="12.0" \
-       EXT_PARALLEL=4 \
-       NVCC_APPEND_FLAGS="--threads 4" \
        MAX_JOBS=4 \
        pip install --no-cache-dir --no-build-isolation . \
     && rm -rf /tmp/sageattention /root/.cache/pip /root/.cache/torch_extensions
@@ -98,9 +97,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # --- Custom-node pack: Lightricks/ComfyUI-LTXVideo (LTX-2.3 nodes,
 #                       low_vram_loaders, LTXVPromptEnhancer, etc.) -----------
+# Full clone (small repo) then check out the pinned SHA. We deliberately do
+# NOT use `git fetch --depth 1 origin <sha>` here — GitHub's uploadpack
+# refuses arbitrary SHAs in shallow-fetch requests unless the repo opts in
+# via `uploadpack.allowReachableSHA1InWant`, and Lightricks' repo doesn't.
 RUN git clone ${LTXVIDEO_NODES_REPO} custom_nodes/ComfyUI-LTXVideo \
     && cd custom_nodes/ComfyUI-LTXVideo \
-    && git fetch --depth 1 origin ${LTXVIDEO_NODES_SHA} \
     && git checkout ${LTXVIDEO_NODES_SHA} \
     && pip install --no-cache-dir -r requirements.txt
 
@@ -115,18 +117,22 @@ RUN git clone --branch ${KJNODES_REF} --depth 1 ${KJNODES_REPO} custom_nodes/Com
 # --- Custom-node pack: evanspearman/ComfyMath (ComfyMathExpression) ----------
 RUN git clone ${COMFYMATH_REPO} custom_nodes/ComfyMath \
     && cd custom_nodes/ComfyMath \
-    && git fetch --depth 1 origin ${COMFYMATH_SHA} \
     && git checkout ${COMFYMATH_SHA} \
     && if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
 
 # --- Python libs explicitly pinned to known-good versions for LTX-2.3 --------
 # (ComfyUI-LTXVideo lists these unpinned; we lock them so the build is byte-
 # identical across rebuilds.)
+# Final pin pass: install our explicit versions of transformers/diffusers/etc.
+# diffusers 0.38.x requires safetensors>=0.8.0-rc.0, which transitively bumps
+# our earlier ComfyUI-pulled safetensors 0.7.0; we intentionally do NOT
+# re-pin safetensors here so pip can resolve cleanly to the diffusers-compatible
+# minor. (versions.env's SAFETENSORS_VERSION is informational; we let the
+# requirements graph speak.)
 RUN pip install --no-cache-dir \
         "transformers==${TRANSFORMERS_VERSION}" \
         "diffusers==${DIFFUSERS_VERSION}" \
         "accelerate==${ACCELERATE_VERSION}" \
-        "safetensors==${SAFETENSORS_VERSION}" \
         "einops==${EINOPS_VERSION}" \
         "kornia==${KORNIA_VERSION}" \
         "ninja~=${NINJA_VERSION}" \

@@ -26,7 +26,7 @@ ARG LLAMACPP_REF
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl git cmake build-essential \
+        ca-certificates curl git cmake build-essential pkg-config \
         libcurl4-openssl-dev libopenblas-dev \
     && rm -rf /var/lib/apt/lists/*
 
