@@ -730,11 +730,25 @@ async def _enhance_prompt(client: httpx.AsyncClient, raw: str) -> str:
         resp.raise_for_status()
         message = resp.json()["choices"][0]["message"]
         enhanced = (message.get("content") or "").strip()
+        reasoning = (message.get("reasoning_content") or "").strip()
+        if reasoning:
+            # Belt-and-suspenders regression detector: with --reasoning off +
+            # --reasoning-budget 0 + chat_template_kwargs.enable_thinking=false,
+            # `reasoning_content` should always be empty. Non-empty here means
+            # the server-side flag was lost or the template default drifted.
+            # Log loud so the regression is caught immediately rather than
+            # silently degrading enhancement quality.
+            log.warning(
+                "prompt enhancer leaked thinking content (%d chars) despite "
+                "thinking-off configuration — investigate server flags and "
+                "chat_template_kwargs",
+                len(reasoning),
+            )
         if not enhanced:
             log.warning(
                 "prompt enhancer returned empty content "
                 "(reasoning_content=%d chars); falling back to raw prompt",
-                len(message.get("reasoning_content") or ""),
+                len(reasoning),
             )
             return raw
         return enhanced.strip('"').strip("'") or raw
