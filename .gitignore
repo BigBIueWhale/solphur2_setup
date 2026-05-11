@@ -10,6 +10,8 @@ outputs/
 test_artifacts/
 bench_runs/
 logs/
+logs_*
+*.log
 *.mp4
 *.png
 *.webm
