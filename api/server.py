@@ -957,12 +957,23 @@ async def generate(req: GenerateRequest) -> FileResponse:
 
     client_id = uuid.uuid4().hex
 
+    # Per-phase wall-clock timing. Each phase is logged and surfaced in
+    # the response headers so a caller (or scripts/measure_default.sh)
+    # can plot the timeline without re-instrumenting. All three phases
+    # are measured even when one is skipped (enhance_seconds == 0.0 when
+    # enhance_prompt=False) so the header schema is stable.
+    t_request_start = time.monotonic()
+
     async with httpx.AsyncClient() as client:
-        prompt_text = (
-            await _enhance_prompt(client, req.prompt) if req.enhance_prompt else req.prompt
-        )
         if req.enhance_prompt:
-            log.info("enhanced prompt: %s", prompt_text[:200])
+            t_enhance_start = time.monotonic()
+            prompt_text = await _enhance_prompt(client, req.prompt)
+            enhance_seconds = time.monotonic() - t_enhance_start
+            log.info("phase enhance: %.2fs (enhanced=%r)", enhance_seconds, prompt_text[:160])
+        else:
+            prompt_text = req.prompt
+            enhance_seconds = 0.0
+            log.info("phase enhance: skipped (enhance_prompt=False)")
 
         workflow = _build_workflow(
             prompt_text=prompt_text,
@@ -976,12 +987,23 @@ async def generate(req: GenerateRequest) -> FileResponse:
             output_filename_prefix=filename_prefix,
         )
 
-        t0 = time.monotonic()
+        t_submit_start = time.monotonic()
         prompt_id = await _submit_workflow(client, workflow, client_id)
-        log.info("submitted prompt_id=%s output_id=%s", prompt_id, output_id)
+        submit_seconds = time.monotonic() - t_submit_start
+        log.info(
+            "phase submit: %.2fs prompt_id=%s output_id=%s",
+            submit_seconds, prompt_id, output_id,
+        )
+
+        t_comfy_start = time.monotonic()
         history = await _poll_completion(client, prompt_id)
-        elapsed = time.monotonic() - t0
-        log.info("completed in %.1fs", elapsed)
+        comfy_seconds = time.monotonic() - t_comfy_start
+        elapsed = time.monotonic() - t_request_start
+        log.info(
+            "phase comfy_run: %.2fs (sampling + upsample + vae + mux); total %.1fs "
+            "(enhance %.2fs + submit %.2fs + comfy %.2fs)",
+            comfy_seconds, elapsed, enhance_seconds, submit_seconds, comfy_seconds,
+        )
 
     output_path = _resolve_output_file(history, output_id)
     return FileResponse(
@@ -997,6 +1019,9 @@ async def generate(req: GenerateRequest) -> FileResponse:
             "X-Solphur2-Fps": str(req.fps),
             "X-Solphur2-Mode": req.mode,
             "X-Solphur2-ElapsedSeconds": f"{elapsed:.1f}",
+            "X-Solphur2-PhaseEnhanceSeconds": f"{enhance_seconds:.2f}",
+            "X-Solphur2-PhaseSubmitSeconds": f"{submit_seconds:.2f}",
+            "X-Solphur2-PhaseComfyRunSeconds": f"{comfy_seconds:.2f}",
             "X-Solphur2-PromptOriginal": req.prompt[:200],
             "X-Solphur2-PromptFinal": prompt_text[:200],
         },

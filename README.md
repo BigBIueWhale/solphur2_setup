@@ -216,12 +216,85 @@ speed over quality, add `"mode":"fast"` to the request body (~7 min, distill LoR
 | `scripts/build.sh [--no-cache]` | pure `docker compose build` — separated so iterations don't re-run model downloads or healthcheck waits | yes (incremental) |
 | `scripts/download_models.sh` | SHA-256-pinned model fetcher (resumable, idempotent) | yes |
 | `scripts/test.sh [--smoke-only/--headline-only/--enhance]` | end-to-end POST `/generate` round-trips. Writes MP4s to `./test_artifacts/`. | yes |
+| `scripts/measure_default.sh "<prompt>" [--skip-build/--no-cache]` | rebuilds via `build.sh`, restarts the stack, runs ONE default-config generation, samples nvidia-smi + cgroup v2 + `/proc` at 1 Hz, prints a peak/timeline summary. The prompt is a required positional argument. Writes raw CSVs + summary to `./bench_runs/measure_default_*/`. | yes |
 | `scripts/bench.py` | binary-search sweep over (resolution × duration × mode) for empirical VRAM/time envelope | yes |
 | `scripts/down.sh` | stop + remove containers and network. Images and models survive. | yes |
 | `scripts/clean.sh [--all]` | full cleanup — containers + images + build cache + outputs (and optionally models) | yes |
 
 Every script is `set -Eeuo pipefail` and fails loudly on the first unexpected condition. No hidden
 side effects, no silent retries.
+
+## Resource peaks and timeline (default config)
+
+Measured on RTX 5090 (sm_120, 32 607 MiB VRAM, 62 GiB host RAM, 32-thread
+host CPU) via `scripts/measure_default.sh "<prompt>"`. The script samples
+nvidia-smi telemetry at 1 Hz, container memory + CPU directly from cgroup v2
+(`memory.current` + `cpu.stat`) at 1 Hz, and host CPU + RAM from `/proc/stat`
++ `/proc/meminfo` at 1 Hz, then aggregates peaks. Per-phase wall-clocks
+come from `api/server.py`'s permanent timing instrumentation, surfaced as
+`X-Solphur2-Phase*` response headers. Numbers below are from one run with
+the prompt `"a beautiful nude woman lying on satin sheets in a dimly lit
+bedroom, soft golden light streaming through sheer curtains, slow cinematic
+tracking camera, intimate sensual atmosphere, professional film
+cinematography, shallow depth of field, 35mm"` — i.e. a realistic NSFW
+prompt that exercises the enhancer and the Sulphur uncensored fine-tune
+end-to-end. To reproduce against your own prompt:
+
+```bash
+bash scripts/measure_default.sh "<your prompt>"            # rebuild + measure
+bash scripts/measure_default.sh "<your prompt>" --skip-build  # reuse current image
+```
+
+### Wall-clock timeline (default = 1280×704 × 10 s × 24 fps × `mode=quality` × `enhance_prompt=true`)
+
+| Phase | Time | What's running |
+|---|---:|---|
+| `enhance` | **34.0 s** | Sulphur Qwen3.5-9B GGUF (CPU, ~22 cores). GPU idle. The mmap'd model is already resident from container start, so this is pure inference time. |
+| `submit`  | 0.0 s | FastAPI → ComfyUI `/prompt`. ComfyUI is warm, so workflow validation and queueing are sub-millisecond. |
+| `comfy_run` | **124.2 s** | Two-stage diffusion on the RTX 5090: stage-1 sampling (50 steps at 640×352 latent, `euler_ancestral` + CFG=3.6), spatial ×2 upsample, stage-2 refinement (3 steps at 1280×704 latent, `euler_cfg_pp` + CFG=1.0), tiled VAE decode, audio VAE decode, h264 mux. |
+| **Total** | **158 s** (~2 min 38 s) | One MP4 returned over HTTP. |
+
+The GPU is **idle for the first ~34 seconds** (the enhancer is CPU-only,
+intentionally so the entire 32 GiB VRAM stays available for the diffusion
+model), then sustained at ~100% compute utilization for ~110 seconds, then
+drops to 0% for the final ~10 seconds while h264 muxing runs on CPU.
+Doubling the duration to 20 s nearly doubles `comfy_run`; pushing the
+resolution to 1080p × 20 s in quality mode lands at ~14 min total per the
+LTX-2.3 envelope tests.
+
+### System requirements (from the same measurement)
+
+| Resource | Peak | Notes |
+|---|---:|---|
+| **VRAM** | **32 031 MiB / 32 607 MiB (98.2%)** | The default config consumes essentially the entire RTX 5090 card. Smaller cards (24 GiB, 16 GiB) **will OOM** at these settings; there is no fallback path. The 1.8% headroom is why we run `--reserve-vram 0.5` and `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. |
+| GPU compute util | 100% peak / 70.1% avg | The 70.1% average is dragged down by the 34 s enhance-phase idle window; during sampling the GPU is pinned at 100%. |
+| GPU power draw | 605 W peak / 430 W avg | RTX 5090 board limit. PSU should be ≥1000 W. |
+| GPU SM clock | 2 910 MHz peak | Within Blackwell's documented operating range; not thermally limited (peak temp 68 °C). |
+| **Comfy container RAM** | **47 474 MiB** | Dominated by the mmap'd FP8 safetensors (27 GiB on disk) plus PyTorch buffers, KJNodes' SageAttention state, and stage-2 output latents staged in host RAM before VAE decode. cgroup v2 `memory.current` counts file-backed cache; in practice Linux can evict these pages under pressure but doing so causes slow page faults next run. |
+| **Enhancer container RAM** | **9 072 MiB** | Mmap'd Q8 Qwen3.5-9B GGUF (~8 GiB) plus the BF16 qwen3vl_merger mmproj (~0.9 GiB). Steady once loaded. The `mem_limit: 12g` cap in `docker-compose.yml` reflects this with ~30% headroom. |
+| API container RAM | 70 MiB | The FastAPI process itself. Negligible. |
+| **Stack RAM peak (concurrent)** | **56 612 MiB** | Sum of the three containers' peaks at the moment of maximum concurrent residency. This is the "must-have-available" floor — a 32 GiB host will swap thrash; **64 GiB host RAM is the practical minimum**. |
+| Comfy CPU peak | 1 809% | ~18 logical cores during VAE decode + h264 mux. |
+| Enhancer CPU peak | 2 276% | ~23 logical cores during the 34 s enhance phase. |
+| Host CPU peak | 98% | One sample per second; the actual instantaneous saturation happens during enhance + during the brief h264 mux window. |
+| Host RAM "used" (anonymous) | 20 633 MiB | This is the host's *anonymous* RAM (heap, stack, dirty pages); the container peaks above include reclaimable file-backed cache that doesn't count here. Together they mean: you need 64 GiB host RAM to keep the model files cached, but the *minimum* anonymous footprint to operate is ~20 GiB. |
+
+#### Reading the resource peaks correctly
+
+Comfy's 47 GiB container RAM peak looks alarming until you realise it
+includes the entire 27 GiB FP8 safetensors mmap'd as page cache. Those
+pages are reclaimable — under memory pressure Linux can drop them and
+re-fault from disk. The honest "must-have-available" number is the
+stack-wide concurrent peak of ~57 GiB. The honest "absolute floor"
+(anonymous-only) is the host's ~20 GiB used metric, but at that floor
+the next request would need to re-mmap the entire model from cold disk
+(slow). 64 GiB host RAM is the practical recommendation.
+
+The 98.2% VRAM utilisation is the headline constraint. Any GPU sharing
+(a desktop environment that grabs a few hundred MiB, a stray nvidia-smi
+process, a CUDA context warm-up by another container) will push the
+default config into OOM. `scripts/up.sh` enforces ≥31 GiB free VRAM
+before bringing the stack up specifically because of this.
 
 ## Why the choices
 
@@ -290,6 +363,36 @@ errors when the distill LoRA's distilled-flow assumptions break against the
 full 50-step trajectory). For now, the validated quality recipe is what
 ships.
 
+#### Fast vs quality is also a fidelity-to-the-fine-tune tradeoff, not only a speed tradeoff
+
+The Sulphur uncensored fine-tune is **baked into the FP8 weights of
+`sulphur_dev_fp8mixed.safetensors`**, not delivered as a runtime LoRA in
+our setup. Both modes therefore load the same uncensored weights — fast
+mode is not "less uncensored" in any binary sense. But the two modes
+differ in how faithfully those weights are exercised:
+
+- **Quality mode (default)** runs the Sulphur weights through their
+  natively-trained 50-step flow-matching trajectory at CFG=3.6,
+  `LTXVScheduler(50, 2.72, 0.8, true, 0.0)` — i.e. the distribution
+  Sulphur was *post-trained on*. Nothing perturbs the weights at runtime.
+- **Fast mode** stacks the TenStrip step-distillation LoRA on top of
+  those same weights at strength 0.7 / 0.5 per stage, so the effective
+  weights along the active denoising path are `Sulphur ⊕ (0.7·distillΔ)`
+  in stage 1 and `Sulphur ⊕ (0.5·distillΔ)` in stage 2. The `condsafe`
+  variant zeroes the cross-attention bridge layers specifically so i2v
+  image conditioning survives, but the remaining LoRA rank-72 deltas
+  still perturb the rest of the network. The distill LoRA was not
+  trained to preserve NSFW signal — it was trained to collapse the
+  8-step trajectory into a single-shot prediction.
+
+In practice both modes produce convincing NSFW output (the
+working-set fine-tune dominates the generative distribution), but on
+prompts at the edge of Sulphur's competence — uncommon anatomical
+configurations, unusual lighting, or scenes Sulphur's training set
+under-represented — quality mode is the more conservative choice.
+**This is why `mode="quality"` is the default**: speed is opt-in, and
+maximum fidelity to the uncensored fine-tune is the headline path.
+
 ### Multi-stage pipeline: half-resolution base, x2 spatial upsample, refine
 
 LTX-2.3 is trained for a max single-pass latent of ~20 temporal tokens
@@ -348,6 +451,51 @@ Q8_0 + BF16 pair costs ~10 GiB of system RAM but **zero VRAM** (it runs on
 CPU via llama.cpp `GGML_CUDA=OFF`), which is the deliberate architectural
 choice that lets the video transformer keep the full 32607 MiB to itself.
 
+#### Empirically verified to elaborate NSFW prompts faithfully, not sanitize
+
+The Sulphur fine-tune sits on top of Qwen 3.5-9B base, which has its own
+refusal and "thinking" tendencies. Three concurrent defenses keep the
+enhancer producing usable output for NSFW prompts at the configured
+sampling envelope (`temperature 0.7, top_p 0.8, top_k 20, min_p 0.0,
+repeat_penalty 1.0, presence_penalty 0.0`):
+
+1. **Server-side flags** in `Dockerfile.enhancer`: `--reasoning off
+   --reasoning-budget 0 --reasoning-format deepseek` — llama.cpp will
+   neither generate a `<think>` block nor count one against the output
+   budget, and any leakage that does occur is routed to the
+   `reasoning_content` field instead of `content`.
+2. **Per-request override** in `api/server.py:_enhance_prompt`:
+   `chat_template_kwargs: {"enable_thinking": false}` belt-and-suspenders
+   to the server flag.
+3. **Sampling envelope chosen against drift**: `presence_penalty=0`
+   specifically because non-zero presence penalty is what pushes the
+   Sulphur fine-tune to substitute generic Qwen vocabulary for the
+   NSFW-specific tokens the user actually asked for. The full envelope
+   was lifted from Sulphur's empirical recommendations, not from
+   Qwen-base defaults.
+
+Verification from `scripts/measure_default.sh` run on
+`"a beautiful nude woman lying on satin sheets in a dimly lit bedroom, soft
+golden light streaming through sheer curtains, slow cinematic tracking
+camera, intimate sensual atmosphere, professional film cinematography,
+shallow depth of field, 35mm"`:
+
+- `finish_reason: stop`, `content_len: 619 chars`, `reasoning_content_len: 0`
+- Enhanced prompt header (truncated to 200 chars in the response): *"The
+  camera provides a slow, cinematic tracking shot of a beautiful nude
+  woman lying on satin sheets in a dimly lit bedroom. The scene is bathed
+  in soft, golden light streaming through sheer curtains, illuminating
+  her smooth ski…"*
+- No refusal, no sanitization, no `<think>` leakage, no truncation of
+  the NSFW-specific tokens. Enhancer wall-clock: 34.0 s on CPU.
+
+If any future regression silently disables one of those three defenses,
+`api/server.py:_enhance_prompt` will log a loud warning
+(`"prompt enhancer leaked thinking content (N chars)…"` or `"prompt
+enhancer returned empty content; falling back to raw prompt"`) so the
+degradation is caught immediately rather than producing silently weaker
+videos.
+
 ### Gemma3 text encoder via the Comfy-Org single-file fp8_scaled
 
 The raw `Lightricks/LTX-2/text_encoder/*.safetensors` (multi-shard
@@ -389,6 +537,8 @@ solphur2_setup/
 │   ├── download_models.sh       SHA-256-pinned, idempotent model fetcher
 │   ├── test.sh                  automated smoke + headline end-to-end tests
 │   ├── bench.py                 binary-search VRAM/time envelope sweep
+│   ├── measure_default.sh       rebuild + measure ONE default-config run (1 Hz GPU/CPU/RAM telemetry)
+│   ├── _measure_client.py       internal Python POST client used by measure_default.sh
 │   ├── down.sh                  graceful teardown
 │   └── clean.sh                 full cleanup (containers, images, cache, optionally models)
 ├── models/                      ← created at first run; gitignored
@@ -406,7 +556,10 @@ Lightricks' canonical LTX-2.3 two-stage distilled example:
 | Knob | `fast` mode | `quality` mode |
 |---|---|---|
 | **Default?** | opt-in (`mode="fast"`) — faster iterations | **YES** (the default) — Sulphur's non-distilled headline path |
-| Distill LoRA applied? | yes, per-stage strengths 0.7 stage 1 + 0.5 stage 2 | no |
+| Wall-clock at 720p × 10 s (measured) | ~75 s comfy_run + ~34 s enhance ≈ ~110 s total | **124 s comfy_run + 34 s enhance = 158 s total** |
+| Wall-clock at 1080p × 20 s (measured) | ~7 min (433 s on Test A) | ~14 min (853 s on Test B) |
+| Distill LoRA applied? | yes, per-stage strengths 0.7 stage 1 + 0.5 stage 2 — perturbs Sulphur weights along the active denoising path (NSFW fine-tune is preserved in the base weights but the rank-72 deltas were not trained to preserve NSFW signal) | no — Sulphur weights are exercised exactly as fine-tuned |
+| Fidelity to Sulphur's training distribution | distilled-trajectory approximation | full 50-step flow-matching trajectory at the CFG Sulphur was trained at |
 | Stage-1 sampler | `euler_ancestral_cfg_pp` | `euler_ancestral` |
 | Stage-1 sigma source | `ManualSigmas` (Lightricks' canonical `DISTILLED_SIGMA_VALUES`) | `LTXVScheduler(50, 2.72, 0.8, true, 0.0)` with `latent` wired |
 | Stage-1 sigmas (fast literal) | `1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0` (9 values = 8 active steps) | — (scheduler-generated) |
