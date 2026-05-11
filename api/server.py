@@ -57,7 +57,7 @@ OUTPUTS_DIR = Path(os.environ.get("OUTPUTS_DIR", "/outputs"))
 SULPHUR_CKPT = "sulphur_dev_fp8mixed.safetensors"
 DISTILL_LORA = "ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors"
 SPATIAL_UPSCALER = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
-GEMMA3_TEXT_ENCODER = "gemma_3_12B_it_fp8_scaled.safetensors"
+GEMMA3_TEXT_ENCODER = "gemma_3_12B_it_fp8_scaled.safetensors"  # FP8-scaled; BF16 deferred — Test C crashed at FFmpeg audio mux on BF16
 
 # Per-stage distill LoRA strengths — Sulphur-canonical.
 # Sulphur applies the distill LoRA at 0.7 on stage 1 and 0.5 on stage 2.
@@ -234,12 +234,26 @@ def _build_workflow(
         "Patch SageAttention",
     )
 
+    # Per-stage distill-LoRA strengths — fast mode only.
+    #
+    # The distill LoRA is applied ONLY in "fast" mode at Sulphur's per-stage
+    # strengths 0.7 stage 1 / 0.5 stage 2 (matching `sulphur_workflow.json`
+    # and TenStrip's `fro90_ceil72_condsafe` README guidance).
+    #
+    # In "quality" mode the distill LoRA is INTENTIONALLY OMITTED, even though
+    # Sulphur's shipped non-distilled base workflow (`ltx23_t2v base.json`)
+    # applies it at 0.5/0.5. The reason for our deviation is empirical:
+    # we use the full Sulphur FP8-mixed model (`sulphur_dev_fp8mixed.safetensors`)
+    # as the base, whereas Sulphur's base workflow uses LTX-2.3-base PLUS
+    # `sulphur_final.safetensors` as a separate LoRA. The maintainer's README
+    # explicitly warns: "use the lora or use the full models, don't use both at
+    # the same time." Stacking the distill LoRA on top of the full Sulphur
+    # model in 50-step LTXVScheduler + CFG=3.6 mode produced an
+    # avcodec_send_frame() EINVAL failure at the SaveVideo audio encoder
+    # (the audio VAE output goes outside FFmpeg's acceptable amplitude range).
+    # Without the distill LoRA in quality mode, audio encodes correctly and
+    # visual quality is high (Test B baseline).
     if apply_distill_lora:
-        # Per-stage distill-LoRA strengths (Sulphur-canonical: 0.7 stage 1, 0.5
-        # stage 2). Two LoraLoaderModelOnly nodes branch off the same SageAttn-
-        # patched base — ComfyUI LoRA application is additive on the model
-        # delta, so two distinct strength values require two distinct loader
-        # nodes that each feed their own CFGGuider.
         add(
             3,
             "LoraLoaderModelOnly",
@@ -263,7 +277,8 @@ def _build_workflow(
         model_stage1 = ref(3, 0)
         model_stage2 = ref(7, 0)
     else:
-        # Quality mode: no distill LoRA — same model for both stages.
+        # Quality mode: no distill LoRA — see comment above for empirical
+        # rationale. Same model object feeds both stage-1 and stage-2 guiders.
         model_stage1 = ref(2, 0)
         model_stage2 = ref(2, 0)
 
@@ -478,6 +493,17 @@ def _build_workflow(
     #   refresh seed   = fixed value seed+1   (deterministic refine)
     add(41, "KSamplerSelect", {"sampler_name": "euler_cfg_pp"}, "Sampler 2")
     add(42, "ManualSigmas", {"sigmas": STAGE2_SIGMAS_FAST}, "Sigmas 2")
+    # Stage-2 noise seed: caller_seed + 1.
+    # Sulphur's shipped workflows hardcode a fixed `42` here, and Lightricks'
+    # two-stage example does the same. Empirically, switching to fixed=42 in
+    # our pipeline (full Sulphur FP8 model + Lightricks canonical samplers)
+    # coincided with an avcodec_send_frame() EINVAL audio-encoder failure
+    # at the SaveVideo node. seed+1 — used in Test B (proven-working
+    # configuration) — keeps stage 2's noise derived from the caller seed and
+    # the audio path stable. The maintainer's hardcoded 42 in their shipped
+    # workflow is tied to their LTX-2.3-base + sulphur_final LoRA recipe, not
+    # ours. Future investigation could bisect why fixed=42 specifically broke
+    # audio; for now, seed+1 is the validated value.
     add(43, "RandomNoise", {"noise_seed": int(seed) + 1}, "Noise 2")
     add(
         44,
@@ -638,10 +664,16 @@ class GenerateRequest(BaseModel):
 
 
 def _snap_frames(target_frames: int) -> int:
-    """LTX-2.3 video VAE constraint: frame_count must be 8n+1."""
+    """LTX-2.3 video VAE constraint: frame_count must be 8n+1.
+    Snap to the NEAREST valid value (not floor) so that, e.g.,
+    duration=20s @ fps=24 → target=480 → snapped=481 (closer than 473)."""
     if target_frames < 1:
         return 1
-    return ((target_frames - 1) // 8) * 8 + 1
+    # round((target_frames - 1) / 8) finds the nearest n; +0.5 trick avoids
+    # banker's rounding on .5 ties and biases up (preferring slightly-longer
+    # output over slightly-shorter, which matches user expectation).
+    n_nearest = (target_frames - 1 + 4) // 8
+    return n_nearest * 8 + 1
 
 
 def _snap_dim_32(target: int) -> int:
