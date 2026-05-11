@@ -119,10 +119,11 @@ services:
       interval: 10s
       timeout: 3s
       retries: 30
-      start_period: 60s
+      start_period: 120s
     restart: unless-stopped
-    # llama.cpp with 8K context + Q8 Qwen3-VL: ~10 GiB of system RAM.
-    mem_limit: 16g
+    # llama.cpp Q8 Qwen3.5-9B + BF16 mmproj + 4K ctx + --cache-ram 0: measured
+    # 10.5 GiB resident on Test E. 12 GiB cap gives ~14% headroom.
+    mem_limit: 12g
 
   api:
     build:

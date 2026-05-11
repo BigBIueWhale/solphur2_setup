@@ -683,11 +683,31 @@ def _snap_dim_32(target: int) -> int:
 
 
 async def _enhance_prompt(client: httpx.AsyncClient, raw: str) -> str:
-    """Round-trip through the Sulphur prompt enhancer (Qwen 3.5-9B hybrid + qwen3vl_merger mmproj) (CPU llama.cpp).
+    """Round-trip through the Sulphur prompt enhancer.
 
-    The enhancer model card ('no system prompt for it, just send the text
-    you'd like to be enhanced') is followed: we pass the raw text as a single
-    user turn and accept the model's content reply verbatim.
+    Belt-and-suspenders against the Sulphur fine-tune's tendency to emit
+    gratuitous <think> blocks despite Qwen3.5-9B's upstream default being
+    thinking-off. An earlier version of this function used a 512-token
+    budget with NO thinking suppression — the model filled the budget with
+    reasoning, returned content="", and we silently fell back to the raw
+    (unenhanced) prompt on every call. Three layers of defense are now in
+    place:
+
+      1. Server-side `--reasoning off --reasoning-budget 0` flags in
+         Dockerfile.enhancer.
+      2. `chat_template_kwargs: {"enable_thinking": false}` per-request
+         (this function).
+      3. `reasoning_format=deepseek` routes any leakage to the
+         `reasoning_content` field; we explicitly check + log if `content`
+         arrives empty (rather than silently surfacing the raw prompt as
+         "enhanced").
+
+    Sampling envelope mirrors the Dockerfile.enhancer CMD so each request
+    is self-describing for debugging, and overrides defend against any
+    server-side drift.
+
+    Read timeout of 180s — at ~6.2 tok/s on a modern desktop CPU and the
+    1024-token --predict ceiling, the worst-case round-trip is ~170s.
     """
     try:
         resp = await client.post(
@@ -695,16 +715,28 @@ async def _enhance_prompt(client: httpx.AsyncClient, raw: str) -> str:
             json={
                 "model": "sulphur-enhancer",
                 "messages": [{"role": "user", "content": raw}],
-                "temperature": 0.7,
-                "top_p": 0.9,
-                "max_tokens": 512,
-                "stream": False,
+                "chat_template_kwargs": {"enable_thinking": False},
+                "temperature":      0.7,
+                "top_p":            0.8,
+                "top_k":            20,
+                "min_p":            0.0,
+                "repeat_penalty":   1.0,
+                "presence_penalty": 0.0,
+                "max_tokens":       1024,
+                "stream":           False,
             },
-            timeout=httpx.Timeout(60.0, read=60.0),
+            timeout=httpx.Timeout(180.0, connect=10.0, read=180.0),
         )
         resp.raise_for_status()
-        enhanced = resp.json()["choices"][0]["message"]["content"].strip()
-        # Strip any wrapping quotes the model may emit.
+        message = resp.json()["choices"][0]["message"]
+        enhanced = (message.get("content") or "").strip()
+        if not enhanced:
+            log.warning(
+                "prompt enhancer returned empty content "
+                "(reasoning_content=%d chars); falling back to raw prompt",
+                len(message.get("reasoning_content") or ""),
+            )
+            return raw
         return enhanced.strip('"').strip("'") or raw
     except Exception as exc:  # noqa: BLE001
         log.warning("prompt enhancer failed (%s); falling back to raw prompt", exc)

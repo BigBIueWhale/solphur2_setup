@@ -4,16 +4,6 @@
 # enhancer model. See README §"Prompt enhancer" for the model architecture
 # and the highest-quality-precision rationale (Qwen 3.5-9B hybrid Q8_0 +
 # BF16 qwen3vl_merger mmproj).
-#
-# Why CPU-only:
-#   • The Sulphur-2-base FP8 mixed video transformer needs ~30 GiB of the
-#     RTX 5090's 32607 MiB VRAM during generation. Sharing the GPU with a
-#     ~10 GiB GGUF would force ComfyUI into weight-streaming and triple
-#     end-to-end latency.
-#   • Prompt enhancement is a one-shot text rewrite per video — a few seconds
-#     on modern CPUs is fine for an offline-style API.
-#   • Keeping this container GPU-free also means it can be restarted, scaled,
-#     or moved to a different host without touching nvidia-container-toolkit.
 
 ARG LLAMACPP_REPO
 ARG LLAMACPP_REF
@@ -35,21 +25,29 @@ RUN git clone --depth 1 --branch ${LLAMACPP_REF} ${LLAMACPP_REPO} /opt/llama.cpp
 
 WORKDIR /opt/llama.cpp
 
-# Build flags:
+# Build flags — see README §"Prompt enhancer build flags" for the full rationale.
 #   GGML_NATIVE=OFF        — no -march=native (image must run on any x86_64).
 #   GGML_CUDA=OFF          — CPU only; no CUDA dependency at runtime.
-#   GGML_BLAS=ON           — use OpenBLAS for matmul (fast on modern Xeons/Ryzens).
+#   GGML_BLAS=ON           — use OpenBLAS for batch prompt-eval matmul.
 #   GGML_BLAS_VENDOR=OpenBLAS — explicit pick to avoid linking ATLAS or MKL.
+#   GGML_OPENMP=ON         — OpenMP parallelism across auto-detected cores.
+#   GGML_LLAMAFILE=ON      — pin Justine Tunney's tinyBLAS kernels for Q8_0;
+#                            ~2x prompt-eval over the legacy GGML kernels on
+#                            similar-gen Intel CPUs per justine.lol/matmul.
+#   GGML_CCACHE=OFF        — skip ccache lookups in a single-shot Docker build.
 #   LLAMA_CURL=ON          — enables HTTP model auto-download in llama-server.
 #   BUILD_SHARED_LIBS=OFF  — fully static binary (smaller runtime image).
 #   LLAMA_BUILD_TESTS=OFF  — skip GGML unit tests.
-#   LLAMA_BUILD_EXAMPLES=OFF — we only want llama-server, not the examples.
+#   LLAMA_BUILD_EXAMPLES=OFF — we only want llama-server + llama-cli.
 RUN cmake -B build \
         -DCMAKE_BUILD_TYPE=Release \
         -DGGML_NATIVE=OFF \
         -DGGML_CUDA=OFF \
         -DGGML_BLAS=ON \
         -DGGML_BLAS_VENDOR=OpenBLAS \
+        -DGGML_OPENMP=ON \
+        -DGGML_LLAMAFILE=ON \
+        -DGGML_CCACHE=OFF \
         -DLLAMA_CURL=ON \
         -DBUILD_SHARED_LIBS=OFF \
         -DLLAMA_BUILD_TESTS=OFF \
@@ -81,30 +79,97 @@ LABEL org.opencontainers.image.title="solphur2/enhancer" \
 
 EXPOSE 8080
 
-# Server flags:
-#   --model / --mmproj          point at the bind-mounted GGUFs.
-#   --host 0.0.0.0 --port 8080  bind inside the container; the compose port
-#                               mapping is `127.0.0.1:8080:8080` so the host
-#                               loopback is the only external surface.
-#   -c 8192                     8K context — Sulphur's enhancer expects
-#                               <500-token input prompts, so 8K is generous.
-#   --jinja                     enable the model's bundled Jinja chat template
-#                               (Qwen 3.5 ships one).
-#   -t -1                       auto-detect CPU thread count (= #physical cores).
-#   --no-context-shift          fail loud if the input exceeds context instead
-#                               of silently dropping tokens.
-#   --temp 0.7 --top-p 0.9      reasonable defaults for prompt rewriting.
-#                               The API service can override per request.
-#   --no-warmup                 skip the warmup pass (first request runs cold;
-#                               this saves ~2s on startup).
+# Server flags — every value is justified in README §"Prompt enhancer".
+#
+# Model + transport:
+#   --model / --mmproj      bind-mounted Q8_0 text + BF16 qwen3vl_merger projector.
+#   --host 0.0.0.0 --port 8080  container interface; compose maps to 127.0.0.1.
+#   --no-webui              we never use llama.cpp's web UI; drop no-op routes.
+#   --metrics               Prometheus /metrics for tok/s + prompt-cache stats.
+#   --log-timestamps        own timestamps so prompt-vs-decode phases are greppable.
+#
+# Memory + context:
+#   -c 4096                 4K context — empirically sized for ≤2600-token input
+#                           (text + 1024-2304 image tokens) and ≤1024 output.
+#   --parallel 1            single slot — api/server.py issues one enhance call
+#                           at a time, and 1 slot avoids the multi-slot
+#                           Qwen3-VL KV-cache bug (llama.cpp issue #17200).
+#   --cache-ram 0           disable host-memory prompt cache (PR #16391).
+#                           Stateless single-shot work has no cache hits;
+#                           setting 0 makes the 12 GiB mem_limit deterministic.
+#   --no-context-shift      fail loud if input exceeds context.
+#
+# Performance:
+#   --flash-attn on         explicit (default 'auto' resolves to on for qwen35
+#                           CPU). Fail loud if the build dropped the kernel.
+#   --cache-type-k f16      explicit defaults; Q4/Q8 KV degrades small-model
+#   --cache-type-v f16      quality and tool-calling per llama.cpp docs.
+#   -t -1                   auto-detect CPU thread count.
+#   --threads-http 2        single-client gateway; default would spawn ~23
+#                           HTTP threads.
+#
+# Multimodal image input (for the i2v use case):
+#   --image-min-tokens 1024 qwen3vl grounding accuracy floor (llama.cpp
+#                           issue #16842; also emitted by llama-server boot log).
+#   --image-max-tokens 2304 caps single image at 96×24 patches so a 4K image
+#                           cannot exhaust the 4096-token context.
+#
+# Reasoning posture (THE critical fix):
+#   The Sulphur fine-tune emits gratuitous <think> blocks even though the
+#   Qwen3.5-9B upstream default is thinking-off. Without these flags, the
+#   model fills 512 tokens with reasoning, returns content="" and
+#   finish_reason="length", and our API silently falls back to the raw
+#   (unenhanced) prompt. Three layers of defense:
+#   --reasoning off         template-level suppression.
+#   --reasoning-budget 0    forcibly emit </think> after 0 reasoning tokens
+#                           (llama.cpp PR #20297, shipped well before b9106).
+#   --reasoning-format deepseek  any leakage routes to `reasoning_content`,
+#                           keeping our consumed `content` field clean.
+#   --jinja                 required for the bundled Qwen3-VL chat template.
+#
+# Sampling (Sulphur-empirical, NOT a verbatim Qwen 3.5 copy):
+#   --temp 0.7              Qwen Non-Thinking-General base.
+#   --top-p 0.8             Tighter than Qwen-Thinking's 0.95 — the fine-tune's
+#                           training distribution drifts to NSFW with looser
+#                           nucleus on neutral prompts.
+#   --top-k 20              Qwen recommendation; cuts the long tail.
+#   --min-p 0.0             Qwen recommendation; top-k=20 already cuts the tail.
+#   --repeat-penalty 1.0    Qwen recommendation across all profiles.
+#   --presence-penalty 0.0  DELIBERATE deviation from Qwen Non-Thinking-General's
+#                           1.5. Empirically presence-penalty>0 increases NSFW
+#                           drift on this fine-tune by biasing away from common
+#                           video-prompt vocabulary toward rarer (often NSFW)
+#                           words. See README §"Prompt enhancer sampling".
+#   --predict 1024          cap server-side runaway generation (client
+#                           max_tokens overrides per request). Real outputs
+#                           are 80–250 tokens; 1024 is 4x headroom.
 CMD ["llama-server", \
-     "--model",   "/models/sulphur_prompt_enhancer_model-q8_0.gguf", \
-     "--mmproj",  "/models/mmproj-BF16.gguf", \
-     "--host",    "0.0.0.0", \
-     "--port",    "8080", \
-     "-c",        "8192", \
-     "--jinja", \
-     "-t",        "-1", \
+     "--model",            "/models/sulphur_prompt_enhancer_model-q8_0.gguf", \
+     "--mmproj",           "/models/mmproj-BF16.gguf", \
+     "--host",             "0.0.0.0", \
+     "--port",             "8080", \
+     "--no-webui", \
+     "--metrics", \
+     "--log-timestamps", \
+     "-c",                 "4096", \
+     "--parallel",         "1", \
+     "--cache-ram",        "0", \
      "--no-context-shift", \
-     "--temp",    "0.7", \
-     "--top-p",   "0.9"]
+     "--flash-attn",       "on", \
+     "--cache-type-k",     "f16", \
+     "--cache-type-v",     "f16", \
+     "-t",                 "-1", \
+     "--threads-http",     "2", \
+     "--image-min-tokens", "1024", \
+     "--image-max-tokens", "2304", \
+     "--reasoning",        "off", \
+     "--reasoning-budget", "0", \
+     "--reasoning-format", "deepseek", \
+     "--jinja", \
+     "--temp",             "0.7", \
+     "--top-p",            "0.8", \
+     "--top-k",            "20", \
+     "--min-p",            "0.0", \
+     "--repeat-penalty",   "1.0", \
+     "--presence-penalty", "0.0", \
+     "--predict",          "1024"]
