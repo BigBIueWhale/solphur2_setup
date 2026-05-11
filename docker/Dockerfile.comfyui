@@ -25,7 +25,6 @@ ARG COMFYUI_SHA
 ARG LTXVIDEO_NODES_REPO
 ARG LTXVIDEO_NODES_SHA
 ARG KJNODES_REPO
-ARG KJNODES_REF
 ARG KJNODES_SHA
 ARG COMFYMATH_REPO
 ARG COMFYMATH_SHA
@@ -107,12 +106,12 @@ RUN git clone ${LTXVIDEO_NODES_REPO} custom_nodes/ComfyUI-LTXVideo \
     && pip install --no-cache-dir -r requirements.txt
 
 # --- Custom-node pack: kijai/ComfyUI-KJNodes -------------------------------
-# Critical for Blackwell FP8: PathchSageAttentionKJ + LTX2_NAG manual_cast_dtype
-# fix from commit 0e173bbfa9de that closes the
-# "addmm_cuda not implemented for Float8_e4m3fn" crash (issue #11920/505).
-RUN git clone --branch ${KJNODES_REF} --depth 1 ${KJNODES_REPO} custom_nodes/ComfyUI-KJNodes \
+# Pinned by SHA (repo ships no tags). See README §"ComfyUI-KJNodes" for
+# why this specific commit is required on Blackwell.
+RUN git clone ${KJNODES_REPO} custom_nodes/ComfyUI-KJNodes \
     && cd custom_nodes/ComfyUI-KJNodes \
-    && pip install --no-cache-dir -r requirements.txt || true
+    && git checkout ${KJNODES_SHA} \
+    && pip install --no-cache-dir -r requirements.txt
 
 # --- Custom-node pack: evanspearman/ComfyMath (ComfyMathExpression) ----------
 RUN git clone ${COMFYMATH_REPO} custom_nodes/ComfyMath \
@@ -164,7 +163,7 @@ LABEL org.opencontainers.image.title="solphur2/comfyui" \
       solphur2.torch="${TORCH_VERSION}" \
       solphur2.comfyui="${COMFYUI_REF}" \
       solphur2.ltxvideo_nodes="${LTXVIDEO_NODES_SHA}" \
-      solphur2.kjnodes="${KJNODES_REF}" \
+      solphur2.kjnodes="${KJNODES_SHA}" \
       solphur2.sageattention="${SAGEATTENTION_REF}"
 
 EXPOSE 8188

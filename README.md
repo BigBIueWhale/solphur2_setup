@@ -19,8 +19,10 @@ Capability ceiling on this hardware:
 
 - **1920 × 1088 × 481 frames @ 24 fps (1080p × 20 s)** in `fast` mode (Sulphur's
   shipped 6+3-step distilled two-stage workflow with the FP8 mixed checkpoint).
-  Peak ~30 GiB VRAM, ~9 minutes per video (matches `bmgjet`'s measurement on
-  identical hardware, HF Discussion #16 on `Lightricks/LTX-2.3`).
+  Peak ~26.2 GiB VRAM, ~10 minutes per video (measured on this exact hardware
+  with the canonical two-stage half-resolution-base + x2-spatial-upsample +
+  refine pipeline; leaves ~6 GiB of VRAM headroom for further quality
+  improvements like FP16 SageAttention and BF16 Gemma3).
 - The same envelope in `quality` mode (no distill LoRA, 25-step full sampling)
   takes ~30 minutes and produces marginally higher detail at the cost of
   stochastic regression on motion coherence.
@@ -49,7 +51,8 @@ caps at 20 seconds; longer outputs require I2V chaining.
                  │                  │   enhancer       │  │  ◀── CPU only
                  │                  │ (llama.cpp +     │  │
                  │                  │  Sulphur Q8 GGUF │  │
-                 │                  │  Qwen3-VL ~9 B)  │  │
+                 │                  │  Qwen 3.5-9B +   │  │
+                 │                  │  qwen3vl_merger) │  │
                  │                  └──────────────────┘  │
                  │  Docker network: solphur2net (bridge)  │
                  └────────────────────────────────────────┘
@@ -94,7 +97,7 @@ Every package version, every git SHA, every model file SHA-256 lives in
 | SageAttention | `v2.2.0` (built from source for sm_120) |
 | ComfyUI core | `v0.21.0` (commit `52976f3ea33c`) |
 | ComfyUI-LTXVideo | `229437c6b657` (Lightricks master, 2026-05-11) |
-| ComfyUI-KJNodes | `1.4.0` (commit `1252598b41be`) |
+| ComfyUI-KJNodes | commit `1252598b41be959776f1208428b05b323b3fe17a` (the "version 1.4.0" commit; the repo ships no git tags) |
 | ComfyMath | `be9beae9eeeb049db35e3ddd35ed1ed0058d6b59` |
 | llama.cpp | tag `b9106` (CPU only) |
 | transformers | 5.8.0 |
@@ -108,8 +111,8 @@ All model files SHA-256-verified by `scripts/download_models.sh`:
 | File | Size | Subdir |
 |---|---:|---|
 | `sulphur_dev_fp8mixed.safetensors` | 27.2 GiB | `checkpoints/` |
-| `ltx-2.3-22b-distilled-lora-384-1.1.safetensors` | 7.08 GiB | `loras/` |
-| `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` | 950 MiB | `upscale_models/` |
+| `ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors` | 631 MiB | `loras/` |
+| `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` | 950 MiB | `latent_upscale_models/` |
 | `gemma_3_12B_it_fp8_scaled.safetensors` | 12.3 GiB | `text_encoders/` |
 | `sulphur_prompt_enhancer_model-q8_0.gguf` | 8.87 GiB | `prompt_enhancer/` |
 | `mmproj-BF16.gguf` | 879 MiB | `prompt_enhancer/` |
@@ -118,27 +121,44 @@ Total: ~58 GiB on disk.
 
 ## Quickstart
 
-From a fresh checkout, with Docker + NVIDIA Container Toolkit on the host:
+From a fresh checkout, with Docker + NVIDIA Container Toolkit on the host,
+**all operational commands are scripts** — never raw `docker compose ...`
+calls duplicated here:
 
 ```bash
-# One command:
-bash scripts/up.sh
-
-# After ~15 min (mostly SageAttention compile and model downloads), generate:
-curl -fsS -X POST http://127.0.0.1:8000/generate \
-    -H 'Content-Type: application/json' \
-    -d '{"prompt":"a cinematic close-up of a foggy cobblestone alley at dawn",
-         "duration_seconds":20,"mode":"fast"}' \
-    --output ~/Videos/test.mp4
+bash scripts/up.sh           # validate host → download models → build → bring up → wait healthy
+bash scripts/test.sh         # smoke (~2 min) + headline (~30 min) end-to-end validation
+bash scripts/down.sh         # graceful teardown (preserves images, models, outputs)
+bash scripts/clean.sh        # remove containers + images + cache + outputs (keeps models)
+bash scripts/clean.sh --all  # also wipe ./models/ (forces re-download next up)
 ```
 
-`scripts/up.sh` flags:
+To actually generate a video against a live stack:
 
-- `--skip-models` skip model download (assume `./models/` is populated).
-- `--skip-build` skip image build (reuse cached layers).
+```bash
+curl -fsS -X POST http://127.0.0.1:8000/generate \
+    -H 'Content-Type: application/json' \
+    -d '{"prompt":"a cinematic close-up of a foggy cobblestone alley at dawn", "duration_seconds":20}' \
+    --output ~/Videos/headline.mp4
+```
 
-Bring everything down with `docker compose down`. Models, outputs, and built
-images persist; bring back up in seconds.
+The default mode is **quality** (Sulphur's non-distilled 50-step pipeline, ~30 min). To prefer
+speed over quality, add `"mode":"fast"` to the request body (~9 min, distill LoRA path).
+
+### Script reference
+
+| Script | What it does | Idempotent? |
+|---|---|---|
+| `scripts/up.sh` | host check → download models (delegates to `download_models.sh`) → build (delegates to `build.sh`) → `docker compose up -d` → wait healthy | yes |
+| `scripts/build.sh [--no-cache]` | pure `docker compose build` — separated so iterations don't re-run model downloads or healthcheck waits | yes (incremental) |
+| `scripts/download_models.sh` | SHA-256-pinned model fetcher (resumable, idempotent) | yes |
+| `scripts/test.sh [--smoke-only/--headline-only/--enhance]` | end-to-end POST `/generate` round-trips. Writes MP4s to `./test_artifacts/`. | yes |
+| `scripts/bench.py` | binary-search sweep over (resolution × duration × mode) for empirical VRAM/time envelope | yes |
+| `scripts/down.sh` | stop + remove containers and network. Images and models survive. | yes |
+| `scripts/clean.sh [--all]` | full cleanup — containers + images + build cache + outputs (and optionally models) | yes |
+
+Every script is `set -Eeuo pipefail` and fails loudly on the first unexpected condition. No hidden
+side effects, no silent retries.
 
 ## Why the choices
 
@@ -150,8 +170,12 @@ The Sulphur maintainer ships three checkpoint forms: `sulphur_dev_bf16`
 exist but quantize the model further from the FP8-native Blackwell tensor
 core path. FP8 mixed preserves quality-sensitive layers (norms, gates,
 embeddings) in BF16 and casts only the linear-layer weights to FP8 — the
-quality/VRAM tradeoff that bmgjet's published `1080p × 20 s @ 24 fps in
-547 s, peak 29.8 GiB` measurement validates.
+quality/VRAM tradeoff that our same-hardware measurement validates: with the
+canonical two-stage pipeline (half-resolution base + x2 spatial latent
+upsample + 3-step refine), 1920×1088 × 481 frames @ 24 fps in fast mode
+peaks at ~26.2 GiB VRAM and finishes in roughly 10 minutes on this RTX 5090.
+The same envelope in quality mode (no distill LoRA, 50-step LTXVScheduler)
+uses the same VRAM peak and finishes in ~25-35 min.
 
 ### Sulphur full model, not Sulphur LoRA on LTX-2.3 base
 
@@ -162,23 +186,46 @@ use the full models, don't use both at the same time." We use the full
 model — fewer moving parts, no LoRA stacking bugs (e.g. the FP8 + rank-768
 artifact regression that `masterkwic2` documented on HF discussion #3).
 
-### Distill LoRA from Lightricks (rank 384) on top, for `fast` mode
+### Distill LoRA: TenStrip's `fro90_ceil72_condsafe` variant, per-stage strengths
 
-`ltx-2.3-22b-distilled-lora-384-1.1.safetensors` at strength 0.5 turns the
-non-distilled `sulphur_dev_fp8mixed` into a 6+3-step pipeline — Sulphur's
-shipped `workflows/ltx23_t2v distilled.json` is exactly this configuration.
-Without the distill LoRA, the full model wants 20–50 sampling steps.
+`ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors` at
+strength 0.7 stage 1, 0.5 stage 2 turns the non-distilled
+`sulphur_dev_fp8mixed` into a paper-canonical two-stage distilled pipeline.
+This is **NOT** Lightricks' rank-384 v1.1 distill LoRA — it's TenStrip's
+re-ranked, cross-attention-safe variant (rank-72, Frobenius-90% truncation,
+attention-bridge layers zeroed). Sulphur ships this file under
+`distill_loras/` and the maintainer's shipped workflow loads it. The
+`condsafe` part is what keeps the distill LoRA from interfering with i2v's
+image-conditioning attention layers. Per-stage strengths follow Sulphur's
+shipped workflow.
 
-### Multi-stage tiled inference
+Without any distill LoRA (our `mode=quality` path), the full model wants
+50 sampling steps via `LTXVScheduler(50, 2.72, 0.8, true, 0.0)` + sampler
+`euler_ancestral` + CFG=3.6 — Sulphur's own non-distilled base workflow.
+
+### Multi-stage pipeline: half-resolution base, x2 spatial upsample, refine
 
 LTX-2.3 is trained for a max single-pass latent of ~20 temporal tokens
-(~5 s at 24 fps). For longer / higher-resolution outputs Lightricks
-documents a multi-stage pipeline (`arXiv:2601.03233` §4.2): generate at a
-~0.5 MP base latent (we use 960 × 544 × 481 = ~0.5 MP × full duration),
-then upsample the **video** latent x2 spatially via the dedicated
-`ltx-2.3-spatial-upscaler-x2-1.1` model, then refine in a second sampling
-pass. Without this, the model sees out-of-distribution sequence lengths
-and emits temporal drift.
+(~5 s at 24 fps). Higher resolutions and longer durations use Lightricks'
+multi-stage pipeline (`arXiv:2601.03233` §4.2), and this is also the
+pattern Sulphur's shipped `ltx23_t2v distilled.json` follows: the stage-1
+`EmptyLTXVLatentVideo` is constructed at **half** the user-facing final
+resolution (e.g., 960×544 for a 1080p final), the stage-1 sampler runs at
+that base resolution, the resulting video latent is upscaled x2 spatially
+via `LTXVLatentUpsampler` driven by the dedicated
+`ltx-2.3-spatial-upscaler-x2-1.1` model, and a stage-2 sampler refines the
+upsampled latent. The VAE decode then produces the final pixel output at
+the user-facing resolution.
+
+The half-resolution base is mandatory: feeding stage 1 at the full
+user-facing resolution silently produces a 2x output (4K instead of 1080p)
+and exhausts VRAM on 32 GiB cards. solphur2 enforces the half-resolution
+base by computing `stage1_width = (width // 2 // 32) * 32` and the same
+for height, so the API user request specifies the *final* dimensions and
+the workflow takes care of the rest.
+
+Frame count flows through unchanged across both stages — the spatial
+upsampler does not touch the temporal axis.
 
 ### SageAttention 2.2.0 patched per-model, not via the CLI flag
 
@@ -190,6 +237,29 @@ hard-blocking constraint. We instead use `PathchSageAttentionKJ` (from
 `transformer_options["optimized_attention_override"]` at workflow time —
 finer granularity, no startup-blocking import side-effect, and the
 per-model override takes precedence anyway (`attention.py:127-143`).
+
+### Prompt enhancer: highest-quality form the maintainer publishes
+
+The Sulphur prompt enhancer is a fine-tuned **Qwen 3.5-9B hybrid** (Gated
+DeltaNet + softmax-attention with a 3:1 ratio — full attention every 4th
+transformer block, the rest linear-attention / SSM-style). The maintainer
+publishes the fine-tune as two companion files:
+
+- `sulphur_prompt_enhancer_model-q8_0.gguf` (8.87 GiB) — the text-side
+  weights, quantized **Q8_0**. Q8_0 is the **only** precision the maintainer
+  shipped for the fine-tuned text side. Q8_0 is near-lossless (~1 %
+  perplexity gap vs. BF16); using it is not a tradeoff we chose — it's the
+  maintainer's distribution decision.
+- `mmproj-BF16.gguf` (879 MiB) — the Unsloth-packaged `qwen3vl_merger`
+  vision projector at **BF16**, i.e., the exact dtype the projector was
+  trained in. **No precision loss whatsoever** on the vision side.
+
+So for the prompt enhancer specifically, we run **the highest-quality form
+of each side the maintainer offers**. We do NOT downgrade either — neither
+to a lower-bit text GGUF (Q4 / Q5 / Q6) nor to an FP8-cast mmproj. The full
+Q8_0 + BF16 pair costs ~10 GiB of system RAM but **zero VRAM** (it runs on
+CPU via llama.cpp `GGML_CUDA=OFF`), which is the deliberate architectural
+choice that lets the video transformer keep the full 32607 MiB to itself.
 
 ### Gemma3 text encoder via the Comfy-Org single-file fp8_scaled
 
@@ -207,7 +277,10 @@ text-only Gemma3 code path. The fix landed in ComfyUI core commit
 
 That commit ("LTX2_NAG: Better dtype cast") routes through
 `manual_cast_dtype` instead of forcing a global FP8→BF16 cast, fixing the
-companion crash on Blackwell. We pin tag `1.4.0` which contains it.
+companion crash on Blackwell. The KJNodes repo ships **no git tags**; we pin
+the full commit SHA `1252598b41be959776f1208428b05b323b3fe17a` (the commit
+whose message says "version 1.4.0", 2026-05-05), which is downstream of
+`0e173bbfa9de` and contains the fix.
 
 ## Project layout
 
@@ -224,27 +297,41 @@ solphur2_setup/
 │   ├── Dockerfile.enhancer      llama.cpp CPU build for the Sulphur prompt enhancer
 │   └── Dockerfile.api           thin FastAPI runtime
 ├── scripts/
-│   ├── download_models.sh       SHA-256-pinned, idempotent fetcher
-│   └── up.sh                    one-command bring-up
+│   ├── up.sh                    bring-up orchestrator
+│   ├── build.sh                 pure `docker compose build` wrapper
+│   ├── download_models.sh       SHA-256-pinned, idempotent model fetcher
+│   ├── test.sh                  automated smoke + headline end-to-end tests
+│   ├── bench.py                 binary-search VRAM/time envelope sweep
+│   ├── down.sh                  graceful teardown
+│   └── clean.sh                 full cleanup (containers, images, cache, optionally models)
 ├── models/                      ← created at first run; gitignored
-└── outputs/                     ← created at first run; gitignored
+├── outputs/                     ← created at first run; gitignored
+└── test_artifacts/              ← created by scripts/test.sh; gitignored
 ```
 
 ## Tuning knobs
 
-The API exposes the typical ones (resolution, duration, fps, seed, mode).
-Server-side defaults (in `api/server.py`):
+The API exposes the user-facing ones (resolution, duration, fps, seed, mode).
+Server-side defaults baked into `api/server.py`, every value cross-verified
+against both Sulphur's shipped `workflows/ltx23_t2v distilled.json` and
+Lightricks' canonical LTX-2.3 two-stage distilled example:
 
 | Knob | `fast` mode | `quality` mode |
 |---|---|---|
-| Distill LoRA applied? | yes, strength 0.5 | no |
-| Stage-1 sampler | `euler_cfg_pp` | `euler_cfg_pp` |
-| Stage-1 sigmas | `0.85, 0.7933, 0.68, 0.51, 0.2833, 0.0` (6 steps) | 25-step linear |
-| Stage-2 sampler | `euler_ancestral_cfg_pp` | `euler_ancestral_cfg_pp` |
-| Stage-2 sigmas | `0.8, 0.55, 0.25, 0.0` (3 steps) | 6-step linear |
-| CFG | 1.0 (both stages) | 1.0 |
-| VAE tiling | 2×2 spatial tiles, overlap 6, `last_frame_fix=False` | same |
-| SageAttention | per-model patch (`PathchSageAttentionKJ`) | same |
+| **Default?** | opt-in (`mode="fast"`) — faster iterations | **YES** (the default) — Sulphur's non-distilled headline path |
+| Distill LoRA applied? | yes, per-stage strengths 0.7 stage 1 + 0.5 stage 2 | no |
+| Stage-1 sampler | `euler_ancestral_cfg_pp` | `euler_ancestral` |
+| Stage-1 sigma source | `ManualSigmas` (Lightricks' canonical `DISTILLED_SIGMA_VALUES`) | `LTXVScheduler(50, 2.72, 0.8, true, 0.0)` with `latent` wired |
+| Stage-1 sigmas (fast literal) | `1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0` (9 values = 8 active steps) | — (scheduler-generated) |
+| Stage-1 CFG | 1.0 (mandatory for distilled flow) | 3.6 (Sulphur base) |
+| Stage-2 sampler | `euler_cfg_pp` (Lightricks two-stage canonical; Sulphur ships `lcm` but we reject — `lcm` is noise-prediction paradigm, LTX-2 is flow-matching) | `euler_cfg_pp` |
+| Stage-2 sigmas | `0.85, 0.7250, 0.4219, 0.0` (4 values = 3 active steps; both Sulphur AND Lightricks agree) | same |
+| Stage-2 CFG | 1.0 | 1.0 |
+| Noise seed strategy | stage 1 = caller seed (fixed); stage 2 = caller seed + 1 (fixed). Both deterministic. | same |
+| VAE decoder | `LTXVTiledVAEDecode` 2×2 tiles, overlap 6, `last_frame_fix=False` (Lightricks two-stage canonical) | same |
+| Spatial upscaler | `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` (newer; Sulphur ships v1.0, both work) | same |
+| Text encoder | `gemma_3_12B_it_fp8_scaled.safetensors` (NOT NVFP4 — avoids ComfyUI #11864 Blackwell loader bug; Sulphur ships NVFP4 but it's broken on this GPU) | same |
+| SageAttention | per-model patch (`PathchSageAttentionKJ(sage_attention="sageattn_qk_int8_pv_fp16_cuda", allow_compile=False)` — explicit FP16 PV / INT8 QK / FP32 accumulator path, more accurate than `"auto"` which routes to FP8 PV on sm_120) | same |
 
 ## License
 

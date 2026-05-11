@@ -18,12 +18,16 @@ Each /generate POST returns exactly one MP4 (Content-Type: video/mp4).
 Atomic single-file response — no streaming, no multipart out.
 
 Hardware ceiling assumptions (validated 2026-05-11 on RTX 5090 sm_120, 32607 MiB):
-  • 1920x1088 × 481 frames @ 24 fps via Sulphur FP8 mixed + distill LoRA peaks
-    ~30 GiB VRAM, ~9 min wall-clock (matches bmgjet's HF Discussion #16 numbers).
-  • "quality" mode (no distill LoRA, 25 full sampling steps) keeps peak VRAM
-    similar but runs ~3-4x slower (~30 min).
+  • 1920x1088 × 481 frames @ 24 fps via Sulphur FP8 mixed + per-stage distill
+    LoRA peaks at ~26.2 GiB VRAM, ~10 min wall-clock. The canonical two-stage
+    pipeline (half-resolution base at 960×544 → x2-spatial-upsample → refine)
+    is what keeps the activation footprint manageable; the wide gap from the
+    32.6 GiB ceiling leaves room for the FP16-SageAttention / BF16-Gemma3
+    quality lifts when those land.
+  • "quality" mode (no distill LoRA, 50-step LTXVScheduler) runs the full
+    non-distilled Sulphur dev model at the same VRAM peak, ~25-35 min.
   • The full 20-second / 24 fps / 1080p envelope is Lightricks' documented max
-    for LTX-2.3 Fast mode (arXiv:2601.03233 §6.3; docs.ltx.video/models).
+    for LTX-2.3 (arXiv:2601.03233 §6.3; docs.ltx.video/models).
 """
 
 from __future__ import annotations
@@ -69,10 +73,10 @@ DISTILL_LORA_STRENGTH_STAGE2 = 0.5
 # Source: LTX-2/packages/ltx-pipelines/src/ltx_pipelines/utils/constants.py
 # Also used verbatim in the official LTX-2.3_T2V_I2V_Two_Stage_Distilled.json
 # example workflow. 9 sigma values = 8 active denoising steps.
-# Sulphur's workflow uses LTXVScheduler(8, 4, 1.5, true, 0.1) — those
-# max_shift/base_shift values are outside Lightricks' documented range and
-# untested on Blackwell; we prefer the Lightricks-canonical ManualSigmas
-# path which bmgjet validated on RTX 5090.
+# Sulphur's own workflow uses LTXVScheduler(8, 4, 1.5, true, 0.1) — those
+# max_shift / base_shift values are outside Lightricks' documented range and
+# untested on Blackwell, so we prefer the documented Lightricks-canonical
+# ManualSigmas path.
 STAGE1_SIGMAS_FAST = (
     "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
 )
@@ -209,10 +213,24 @@ def _build_workflow(
 
     add(1, "CheckpointLoaderSimple", {"ckpt_name": SULPHUR_CKPT}, "Checkpoint")
 
+    # SageAttention mode: explicit FP16 PV path, NOT "auto".
+    # On sm_120, KJNodes' "auto" dispatcher in SageAttention 2.2.0 routes to
+    # `sageattn_qk_int8_pv_fp8_cuda(pv_accum_dtype="fp32+fp16")` — the LEAST
+    # accurate non-FP4 option available. The explicit
+    # `sageattn_qk_int8_pv_fp16_cuda` mode keeps PV in FP16 with an FP32
+    # accumulator (closer to SDPA baseline) at the cost of ~10-20% attention-
+    # kernel slowdown vs FP8 — still 25-30% faster than naive SDPA per
+    # mobcat40's RTX 5090 benchmarks. Cross-referenced against the canonical
+    # community recommendation in Comfy-Org/ComfyUI Discussion #11583 and the
+    # mobcat40/sageattention-blackwell README.
     add(
         2,
         "PathchSageAttentionKJ",
-        {"model": ref(1, 0), "sage_attention": "auto", "allow_compile": False},
+        {
+            "model": ref(1, 0),
+            "sage_attention": "sageattn_qk_int8_pv_fp16_cuda",
+            "allow_compile": False,
+        },
         "Patch SageAttention",
     )
 
@@ -285,8 +303,19 @@ def _build_workflow(
     # (shipped by ComfyUI-LTXVideo, utility_nodes.py:38-49).
     add(111, "LTXFloatToInt", {"a": ref(110, 0)}, "Frame Rate (int)")
 
-    add(120, "PrimitiveInt", {"value": int(width)}, "Width")
-    add(121, "PrimitiveInt", {"value": int(height)}, "Height")
+    # Width/Height the caller asked for is the FINAL output resolution. The
+    # two-stage pipeline runs stage 1 at HALF that resolution, then the
+    # LTXVLatentUpsampler x2-spatial-upscales to the final size before the
+    # stage-2 refinement pass. This is exactly the pattern in Sulphur's shipped
+    # workflows/ltx23_t2v distilled.json (math nodes #18 and #20 compute a/2)
+    # AND in Lightricks' LTX-2.3_T2V_I2V_Two_Stage_Distilled.json
+    # (EmptyLTXVLatentVideo widget [960, 544, 121, 1] for a 1920x1088 final).
+    # Half-resolution must also be mod-32; we snap to the nearest mod-32 floor.
+    stage1_width = (int(width) // 2 // 32) * 32
+    stage1_height = (int(height) // 2 // 32) * 32
+
+    add(120, "PrimitiveInt", {"value": stage1_width}, "Stage1 Width")
+    add(121, "PrimitiveInt", {"value": stage1_height}, "Stage1 Height")
     add(122, "PrimitiveInt", {"value": int(frames)}, "Length")
     add(130, "PrimitiveInt", {"value": int(seed)}, "Seed")
 
@@ -574,18 +603,27 @@ class GenerateRequest(BaseModel):
         ),
     )
     mode: str = Field(
-        "fast",
+        "quality",
         pattern="^(fast|quality)$",
         description=(
-            "fast    = 6+3-step distilled, ~9 min @ 1080p×20s on RTX 5090. "
-            "quality = 25+6-step full sampling, no distill LoRA, ~30 min."
+            "quality = Sulphur's non-distilled base config (50-step "
+            "LTXVScheduler + euler_ancestral + CFG=3.6 stage 1, 3-step refine "
+            "stage 2). Same Sulphur FP8 mixed weights, same VRAM peak (~30 "
+            "GiB), ~25-35 min on RTX 5090. This is the DEFAULT — quality is "
+            "the headline target. "
+            "fast    = Sulphur's distilled config with TenStrip's "
+            "fro90_ceil72_condsafe LoRA at strengths 0.7+0.5 + 8-step "
+            "DISTILLED_SIGMA_VALUES + euler_ancestral_cfg_pp. Same VRAM, "
+            "~10 min on RTX 5090. Opt in by passing mode='fast' for fast "
+            "iteration / preview."
         ),
     )
     enhance_prompt: bool = Field(
         True,
         description=(
-            "If true, the prompt is rewritten by the Sulphur Qwen3-VL prompt "
-            "enhancer (CPU llama.cpp) before generation. Adds 3-8 s latency, "
+            "If true, the prompt is rewritten by the Sulphur prompt "
+            "enhancer (fine-tuned Qwen 3.5-9B hybrid + qwen3vl_merger mmproj, "
+            "CPU llama.cpp) before generation. Adds 3-8 s latency, "
             "zero VRAM cost."
         ),
     )
@@ -612,7 +650,7 @@ def _snap_dim_32(target: int) -> int:
 
 
 async def _enhance_prompt(client: httpx.AsyncClient, raw: str) -> str:
-    """Round-trip through the Sulphur Qwen3-VL prompt enhancer (CPU llama.cpp).
+    """Round-trip through the Sulphur prompt enhancer (Qwen 3.5-9B hybrid + qwen3vl_merger mmproj) (CPU llama.cpp).
 
     The enhancer model card ('no system prompt for it, just send the text
     you'd like to be enhanced') is followed: we pass the raw text as a single

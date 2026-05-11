@@ -1,129 +1,126 @@
 #!/usr/bin/env bash
-# scripts/up.sh — single command from a fresh checkout to a running stack.
+# scripts/up.sh — one-command bring-up of the solphur2 stack.
 #
-# Steps:
-#   1. Validate host (Docker, NVIDIA Container Toolkit, RTX 5090, free VRAM).
-#   2. Download all models (SHA-256 verified, idempotent).
-#   3. Build all three Docker images.
-#   4. Bring the compose stack up, wait for healthy state.
-#   5. Print the API endpoint and a curl example.
+# Orchestrates the other scripts in the canonical order. Each step is
+# idempotent — re-running scripts/up.sh after a successful prior run
+# converges to "stack is healthy" without doing redundant work.
 #
-# Usage:
-#     bash scripts/up.sh                # full bring-up
-#     bash scripts/up.sh --skip-build   # skip image builds (use cached)
-#     bash scripts/up.sh --skip-models  # skip the model download
+# Steps (each delegated to its own script — no duplicated commands):
+#   1. Validate host hardware (NVIDIA GeForce RTX 5090, sm_120, Docker,
+#      NVIDIA Container Toolkit, sufficient VRAM headroom).
+#   2. Download all SHA-256-pinned model files (scripts/download_models.sh).
+#   3. Build the three Docker images (scripts/build.sh).
+#   4. Bring up the compose stack and wait for all three healthchecks.
+#   5. Print the bound endpoints and the next-step command.
+#
+# Verifying generation actually works is delegated to scripts/test.sh —
+# this script does not run a generation by itself.
+#
+# Flags:
+#     --skip-validate   skip host hardware validation (use if running on
+#                       a non-5090 box for experimentation)
+#     --skip-models     skip the model download (assume models/ is populated)
+#     --skip-build      skip the Docker build (reuse cached images)
 
 set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-SKIP_BUILD=0
-SKIP_MODELS=0
+log()  { printf '[\033[36msolphur2-up\033[0m %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+fail() { printf '[\033[31msolphur2-up\033[0m %s] %s\n' "$(date +%H:%M:%S)" "$*"; exit 1; }
+
+DO_VALIDATE=1
+DO_MODELS=1
+DO_BUILD=1
 for arg in "$@"; do
     case "$arg" in
-        --skip-build)  SKIP_BUILD=1 ;;
-        --skip-models) SKIP_MODELS=1 ;;
-        *) echo "unknown flag: $arg" >&2; exit 64 ;;
+        --skip-validate)  DO_VALIDATE=0 ;;
+        --skip-models)    DO_MODELS=0 ;;
+        --skip-build)     DO_BUILD=0 ;;
+        *) echo "scripts/up.sh: unknown flag: $arg" >&2; exit 64 ;;
     esac
 done
 
-log() { printf '[\033[36msolphur2\033[0m %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
-fail() { printf '[\033[31msolphur2\033[0m %s] %s\n' "$(date +%H:%M:%S)" "$*"; exit 1; }
+# --- 1. Host validation ----------------------------------------------------
+if [[ "$DO_VALIDATE" -eq 1 ]]; then
+    log "validating host..."
+    command -v docker >/dev/null || fail "docker not installed"
+    docker compose version >/dev/null 2>&1 || fail "docker compose plugin missing"
+    command -v nvidia-smi >/dev/null || fail "nvidia-smi not found; install the NVIDIA driver"
 
-# --- Host validation --------------------------------------------------------
-log "validating host..."
-
-command -v docker >/dev/null || fail "docker not installed; expected docker-ce on this host"
-docker compose version >/dev/null 2>&1 || fail "docker compose plugin missing"
-
-# Confirm the RTX 5090 + driver 595 + sm_120 are what we expect.
-if command -v nvidia-smi >/dev/null; then
     GPU_INFO="$(nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader,nounits | head -1)"
     log "GPU: $GPU_INFO"
     case "$GPU_INFO" in
         *"RTX 5090"*"12.0"*) ;;
-        *) fail "expected NVIDIA GeForce RTX 5090 (compute_cap 12.0); got: $GPU_INFO" ;;
+        *) fail "expected NVIDIA GeForce RTX 5090 (compute cap 12.0); got: $GPU_INFO" ;;
     esac
-else
-    fail "nvidia-smi not found; install/verify the NVIDIA driver first"
+
+    VRAM_FREE_MIB="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)"
+    log "VRAM free: ${VRAM_FREE_MIB} MiB / 32607 MiB total"
+    if [[ "$VRAM_FREE_MIB" -lt 31000 ]]; then
+        fail "less than 31 GiB VRAM free; stop other GPU users (try 'docker ps' / 'nvidia-smi') before continuing"
+    fi
 fi
 
-# Make sure no rogue tenant is holding most of the VRAM. Hard threshold: any
-# running compute process (other than Xorg) is treated as a conflict, since
-# Sulphur FP8 mixed wants ~30 GiB of the 32607 MiB on this card.
-HEAVY_PROCS="$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true)"
-if [[ -n "$HEAVY_PROCS" ]]; then
-    log "current GPU compute processes:"
-    printf '  %s\n' "$HEAVY_PROCS"
-    log "if any of these are using significant VRAM, stop them before continuing."
-fi
-
-# --- Models -----------------------------------------------------------------
-if [[ "$SKIP_MODELS" -ne 1 ]]; then
-    log "downloading models (SHA-256 verified, idempotent)..."
+# --- 2. Download models ----------------------------------------------------
+if [[ "$DO_MODELS" -eq 1 ]]; then
+    log "downloading models (SHA-256-verified, idempotent)..."
     bash scripts/download_models.sh
 else
     log "skipping model download (--skip-models)"
 fi
 
-# --- Build images -----------------------------------------------------------
-if [[ "$SKIP_BUILD" -ne 1 ]]; then
-    log "building docker images (this can take 10-15 minutes for the comfyui image's SageAttention compile)..."
-    docker compose --env-file versions.env build --parallel
+# --- 3. Build images -------------------------------------------------------
+if [[ "$DO_BUILD" -eq 1 ]]; then
+    log "building Docker images..."
+    bash scripts/build.sh
 else
-    log "skipping docker build (--skip-build)"
+    log "skipping Docker build (--skip-build)"
 fi
 
-# --- Up ---------------------------------------------------------------------
+# --- 4. Bring up the stack ------------------------------------------------
 log "starting compose stack..."
 docker compose --env-file versions.env up -d
 
-log "waiting for components to report healthy (this can take ~2 minutes on first run)..."
+log "waiting for all three components to report healthy (≤10 min)..."
 deadline=$(( $(date +%s) + 600 ))
 while (( $(date +%s) < deadline )); do
-    READY=1
+    ready=1
     for svc in comfyui enhancer api; do
-        STATUS="$(docker inspect --format '{{.State.Health.Status}}' solphur2-$svc 2>/dev/null || echo missing)"
-        if [[ "$STATUS" != "healthy" ]]; then
-            READY=0
+        status="$(docker inspect --format '{{.State.Health.Status}}' "solphur2-$svc" 2>/dev/null || echo missing)"
+        if [[ "$status" != "healthy" ]]; then
+            ready=0
             break
         fi
     done
-    if (( READY == 1 )); then
-        log "all services healthy."
-        break
-    fi
+    (( ready == 1 )) && break
     sleep 5
 done
 
-if (( READY != 1 )); then
-    log "components did not reach healthy within 10 minutes; current status:"
-    docker compose ps
-    fail "see 'docker compose logs <service>' for details"
-fi
+(( ready == 1 )) || {
+    docker compose --env-file versions.env ps
+    fail "components did not reach healthy within 10 minutes; see 'docker compose logs <service>' for details"
+}
 
-# --- Smoke test -------------------------------------------------------------
-log "smoke-testing the API..."
-curl -fsS http://127.0.0.1:8000/healthz | tee /dev/stderr >/dev/null
-echo
+log "all three components healthy."
 
+# --- 5. Print endpoints ---------------------------------------------------
 cat <<EOF
 
-  solphur2 is up.  All inbound on 127.0.0.1 only.
+  solphur2 is up. All inbound on 127.0.0.1 only.
 
-  API:        http://127.0.0.1:8000/
-  Health:     http://127.0.0.1:8000/healthz
-  ComfyUI:    http://127.0.0.1:8188/  (for debugging; the API does the work)
-  Enhancer:   http://127.0.0.1:8080/  (for debugging only)
+  API:        http://127.0.0.1:8000/        (POST /generate)
+  ComfyUI:    http://127.0.0.1:8188/        (debug only)
+  Enhancer:   http://127.0.0.1:8080/        (debug only)
 
-  Test generation (writes the MP4 to /tmp/solphur2_test.mp4):
-      curl -fsS -X POST http://127.0.0.1:8000/generate \\
-          -H 'Content-Type: application/json' \\
-          -d '{"prompt":"a cinematic close-up of a foggy cobblestone alley at dawn","duration_seconds":20,"mode":"fast"}' \\
-          --output /tmp/solphur2_test.mp4
+  Verify everything works end-to-end (~2 min smoke + ~30 min headline):
+      bash scripts/test.sh
 
-  Bring the stack down:
-      docker compose down
+  Smoke only (~2 min):
+      bash scripts/test.sh --smoke-only
+
+  Bring everything down (preserves images + models + outputs):
+      bash scripts/down.sh
 
 EOF

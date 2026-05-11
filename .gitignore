@@ -7,6 +7,8 @@ models/
 
 # Outputs and runtime state
 outputs/
+test_artifacts/
+bench_runs/
 logs/
 *.mp4
 *.png

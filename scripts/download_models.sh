@@ -103,7 +103,10 @@ fetch() {
 #   checkpoints/      → CheckpointLoaderSimple, LTXVAudioVAELoader.ckpt_name,
 #                       LTXAVTextEncoderLoader.ckpt_name (all read here).
 #   loras/            → LoraLoaderModelOnly.
-#   upscale_models/   → LatentUpscaleModelLoader.
+#   latent_upscale_models/ → LatentUpscaleModelLoader (LATENT-space upscalers
+#                            such as the LTX-2.3 spatial upscaler; this is a
+#                            DIFFERENT folder than `upscale_models/` which holds
+#                            image-space ESRGAN-style models).
 #   text_encoders/    → LTXAVTextEncoderLoader.text_encoder.
 #   prompt_enhancer/  → llama-server (mounted directly, not a ComfyUI dir).
 
@@ -119,7 +122,7 @@ fetch loras \
     "${LTX_DISTILL_LORA_SIZE}" \
     "${LTX_DISTILL_LORA_URL}"
 
-fetch upscale_models \
+fetch latent_upscale_models \
     "${LTX_SPATIAL_UPSCALER_PATH}" \
     "${LTX_SPATIAL_UPSCALER_SHA256}" \
     "${LTX_SPATIAL_UPSCALER_SIZE}" \

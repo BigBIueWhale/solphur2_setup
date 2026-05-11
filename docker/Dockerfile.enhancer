@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1.7
 #
 # solphur2/enhancer — CPU-only llama.cpp server hosting the Sulphur prompt
-# enhancer model (Qwen3-VL-based, Q8_0 GGUF + BF16 multimodal projector).
+# enhancer model. See README §"Prompt enhancer" for the model architecture
+# and the highest-quality-precision rationale (Qwen 3.5-9B hybrid Q8_0 +
+# BF16 qwen3vl_merger mmproj).
 #
 # Why CPU-only:
 #   • The Sulphur-2-base FP8 mixed video transformer needs ~30 GiB of the
@@ -15,7 +17,6 @@
 
 ARG LLAMACPP_REPO
 ARG LLAMACPP_REF
-ARG LLAMACPP_SHA
 
 # ---- Build stage ------------------------------------------------------------
 FROM ubuntu:24.04 AS builder
@@ -61,8 +62,11 @@ FROM ubuntu:24.04 AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Only the bare minimum runtime libs.
+# `curl` is here purely for the docker-compose healthcheck (`curl -fsS .../health`).
+# Without it the healthcheck fails despite llama-server being healthy, which
+# blocks the dependent `api` service from starting.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libcurl4 libgomp1 libopenblas0 \
+        ca-certificates curl libcurl4 libgomp1 libopenblas0 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
@@ -85,7 +89,7 @@ EXPOSE 8080
 #   -c 8192                     8K context — Sulphur's enhancer expects
 #                               <500-token input prompts, so 8K is generous.
 #   --jinja                     enable the model's bundled Jinja chat template
-#                               (Qwen3-VL ships one).
+#                               (Qwen 3.5 ships one).
 #   -t -1                       auto-detect CPU thread count (= #physical cores).
 #   --no-context-shift          fail loud if the input exceeds context instead
 #                               of silently dropping tokens.
