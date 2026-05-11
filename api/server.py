@@ -19,13 +19,14 @@ Atomic single-file response — no streaming, no multipart out.
 
 Hardware ceiling assumptions (validated 2026-05-11 on RTX 5090 sm_120, 32607 MiB):
   • 1920x1088 × 481 frames @ 24 fps via Sulphur FP8 mixed + per-stage distill
-    LoRA peaks at ~26.2 GiB VRAM, ~10 min wall-clock. The canonical two-stage
+    LoRA peaks at ~26.2 GiB VRAM, ~7 min wall-clock (measured 433s on Test A).
+    The canonical two-stage
     pipeline (half-resolution base at 960×544 → x2-spatial-upsample → refine)
     is what keeps the activation footprint manageable; the wide gap from the
     32.6 GiB ceiling leaves room for the FP16-SageAttention / BF16-Gemma3
     quality lifts when those land.
   • "quality" mode (no distill LoRA, 50-step LTXVScheduler) runs the full
-    non-distilled Sulphur dev model at the same VRAM peak, ~25-35 min.
+    non-distilled Sulphur dev model at the same VRAM peak, ~14 min (measured 853s on RTX 5090 Test B).
   • The full 20-second / 24 fps / 1080p envelope is Lightricks' documented max
     for LTX-2.3 (arXiv:2601.03233 §6.3; docs.ltx.video/models).
 """
@@ -635,12 +636,12 @@ class GenerateRequest(BaseModel):
             "quality = Sulphur's non-distilled base config (50-step "
             "LTXVScheduler + euler_ancestral + CFG=3.6 stage 1, 3-step refine "
             "stage 2). Same Sulphur FP8 mixed weights, same VRAM peak (~30 "
-            "GiB), ~25-35 min on RTX 5090. This is the DEFAULT — quality is "
+            "GiB), ~14 min (measured 853s on RTX 5090 Test B) on RTX 5090. This is the DEFAULT — quality is "
             "the headline target. "
             "fast    = Sulphur's distilled config with TenStrip's "
             "fro90_ceil72_condsafe LoRA at strengths 0.7+0.5 + 8-step "
             "DISTILLED_SIGMA_VALUES + euler_ancestral_cfg_pp. Same VRAM, "
-            "~10 min on RTX 5090. Opt in by passing mode='fast' for fast "
+            "~7 min on RTX 5090 (measured 433s). Opt in by passing mode='fast' for fast "
             "iteration / preview."
         ),
     )

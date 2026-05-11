@@ -19,12 +19,12 @@ Capability ceiling on this hardware:
 
 - **1920 × 1088 × 481 frames @ 24 fps (1080p × 20 s)** in `fast` mode (Sulphur's
   shipped 6+3-step distilled two-stage workflow with the FP8 mixed checkpoint).
-  Peak ~26.2 GiB VRAM, ~10 minutes per video (measured on this exact hardware
+  Peak ~26.2 GiB VRAM, ~7 minutes (measured 433s on Test A) per video (measured on this exact hardware
   with the canonical two-stage half-resolution-base + x2-spatial-upsample +
   refine pipeline; leaves ~6 GiB of VRAM headroom for further quality
   improvements like FP16 SageAttention and BF16 Gemma3).
 - The same envelope in `quality` mode (no distill LoRA, 25-step full sampling)
-  takes ~30 minutes and produces marginally higher detail at the cost of
+  takes ~14 minutes and produces marginally higher detail at the cost of
   stochastic regression on motion coherence.
 
 This is Lightricks' documented Fast/1080p maximum (`arXiv:2601.03233` §6.3
@@ -74,7 +74,8 @@ trip. Endpoint:
 ```
 POST http://127.0.0.1:8000/generate
 Content-Type: application/json
-{ "prompt": "<free text>", "duration_seconds": 20, "mode": "fast" }
+{ "prompt": "<free text>", "duration_seconds": 20 }
+# (mode defaults to "quality"; pass "mode":"fast" only if you want the ~7 min distilled path)
 → 200 OK
   Content-Type: video/mp4
   <MP4 bytes>
@@ -127,7 +128,7 @@ calls duplicated here:
 
 ```bash
 bash scripts/up.sh           # validate host → download models → build → bring up → wait healthy
-bash scripts/test.sh         # smoke (~2 min) + headline (~30 min) end-to-end validation
+bash scripts/test.sh         # smoke (~2 min) + headline (~14 min) end-to-end validation
 bash scripts/down.sh         # graceful teardown (preserves images, models, outputs)
 bash scripts/clean.sh        # remove containers + images + cache + outputs (keeps models)
 bash scripts/clean.sh --all  # also wipe ./models/ (forces re-download next up)
@@ -142,8 +143,8 @@ curl -fsS -X POST http://127.0.0.1:8000/generate \
     --output ~/Videos/headline.mp4
 ```
 
-The default mode is **quality** (Sulphur's non-distilled 50-step pipeline, ~30 min). To prefer
-speed over quality, add `"mode":"fast"` to the request body (~9 min, distill LoRA path).
+The default mode is **quality** (Sulphur's non-distilled 50-step pipeline, ~14 min). To prefer
+speed over quality, add `"mode":"fast"` to the request body (~7 min, distill LoRA path).
 
 ### Script reference
 
@@ -175,7 +176,7 @@ canonical two-stage pipeline (half-resolution base + x2 spatial latent
 upsample + 3-step refine), 1920×1088 × 481 frames @ 24 fps in fast mode
 peaks at ~26.2 GiB VRAM and finishes in roughly 10 minutes on this RTX 5090.
 The same envelope in quality mode (no distill LoRA, 50-step LTXVScheduler)
-uses the same VRAM peak and finishes in ~25-35 min.
+uses the same VRAM peak and finishes in ~14 min.
 
 ### Sulphur full model, not Sulphur LoRA on LTX-2.3 base
 
@@ -202,6 +203,30 @@ shipped workflow.
 Without any distill LoRA (our `mode=quality` path), the full model wants
 50 sampling steps via `LTXVScheduler(50, 2.72, 0.8, true, 0.0)` + sampler
 `euler_ancestral` + CFG=3.6 — Sulphur's own non-distilled base workflow.
+
+**Deviation from Sulphur's base workflow in quality mode:** Sulphur's shipped
+`ltx23_t2v base.json` *also* applies the distill LoRA at strength 0.5/0.5
+even in non-distilled mode (this is the audit recommendation we initially
+adopted as "Knob 16a"). We **do not** apply the distill LoRA in our quality
+mode, because Sulphur's base workflow stacks the distill LoRA on top of
+`LTX-2.3-base + sulphur_final.safetensors` — a fundamentally different
+recipe from our `Sulphur full FP8 model alone` recipe. The maintainer's
+README explicitly forbids mixing the Sulphur full model with
+`sulphur_final.safetensors`. Stacking the distill LoRA on the full Sulphur
+FP8 model with 50-step LTXVScheduler + CFG=3.6 produces an audio waveform
+that FFmpeg's h264 audio muxer rejects with
+`avcodec_send_frame() returned 22` (EINVAL) at the SaveVideo node — we
+empirically observed this failure in Tests B' and C. Quality mode therefore
+runs the full Sulphur model standalone with the audit-recommended 50-step
+schedule. This is "the working maximum-quality config given the recipe
+constraint", not "the audit-canonical config."
+
+Future investigation could bisect why exactly `distill LoRA + Sulphur full
+model + 50 LTXVScheduler + CFG=3.6` breaks the audio path (most likely the
+audio VAE's outputs go out of `[-1, +1]` due to compounding precision
+errors when the distill LoRA's distilled-flow assumptions break against the
+full 50-step trajectory). For now, the validated quality recipe is what
+ships.
 
 ### Multi-stage pipeline: half-resolution base, x2 spatial upsample, refine
 

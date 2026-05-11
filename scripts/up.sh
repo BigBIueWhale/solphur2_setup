@@ -114,7 +114,7 @@ cat <<EOF
   ComfyUI:    http://127.0.0.1:8188/        (debug only)
   Enhancer:   http://127.0.0.1:8080/        (debug only)
 
-  Verify everything works end-to-end (~2 min smoke + ~30 min headline):
+  Verify everything works end-to-end (~2 min smoke at 720p × 5s + ~14 min headline at 1080p × 20s):
       bash scripts/test.sh
 
   Smoke only (~2 min):
