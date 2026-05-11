@@ -1015,14 +1015,20 @@ async def generate_i2v(
 ) -> FileResponse:
     """Image-to-video (stub in v1).
 
-    The workflow builder above is t2v-shaped; a follow-up commit will add the
-    LTXVImgToVideoConditionOnly + LoadImage nodes and patch the conditioning
-    chain to consume the uploaded image as the first frame.
+    Sulphur-2-base inherits i2v from LTX-2.3 base but the Sulphur maintainer's
+    model card explicitly recommends `TenStrip/LTX2.3-10Eros` for serious i2v
+    use ("his i2v merge of sulphur 2, highly recommend for i2v"). Wiring i2v
+    is therefore deliberately deferred — it implies either (a) a separate
+    model download + workflow for the 10Eros merge, or (b) accepting that
+    i2v on Sulphur-2-base alone is the maintainer's secondary path. Either
+    choice is a v1.1 decision, not a flag-flip on the t2v workflow.
     """
     raise HTTPException(
         status_code=501,
         detail=(
-            "i2v not wired in this initial release. Use POST /generate for t2v. "
-            "The image upload field is accepted so the surface is stable for v1.1."
+            "i2v not wired in v1. Sulphur-2-base inherits i2v from LTX-2.3 "
+            "but the maintainer recommends TenStrip/LTX2.3-10Eros for serious "
+            "i2v use. See README §'Modality: t2v primary' for the v1.1 plan. "
+            "Use POST /generate (t2v) for now."
         ),
     )

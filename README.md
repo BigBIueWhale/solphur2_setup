@@ -51,6 +51,41 @@ model). 1920×1088 × 481 frames is 2× the stage-1 area and 2× the frame
 count the fine-tune was tested at — within LTX-2.3 native, but out-of-
 distribution for Sulphur.
 
+### Modality: t2v is Sulphur's primary path, i2v is inherited
+
+`SulphurAI/Sulphur-2-base` is **primarily a text-to-video fine-tune**.
+It inherits image-to-video capability from the LTX-2.3 base architecture
+(the model can accept image conditioning), but the maintainer's own
+recommendation in the model card is unambiguous about which model to use
+for which job:
+
+- **For text-to-video** (`/generate`): `Sulphur-2-base` is the
+  maintainer's primary published artifact. The Sulphur shipped workflows
+  `ltx23_t2v distilled.json` and `ltx23_t2v base.json` are the maintainer's
+  tested t2v paths. **Our `/generate` endpoint maps directly to this path.**
+- **For image-to-video**: the Sulphur model card explicitly recommends
+  [`TenStrip/LTX2.3-10Eros`](https://huggingface.co/TenStrip/LTX2.3-10Eros)
+  — verbatim: *"his i2v merge of sulphur 2, highly recommend for i2v"*.
+  TenStrip's "10Eros" is a *merge* of Sulphur-2-base with an additional
+  i2v-leaning checkpoint, published specifically because Sulphur-2-base
+  alone was perceived to need supplementation for serious i2v use.
+
+Implications for solphur2:
+
+- **`/generate` (t2v)** is the headline use case. Sulphur-2-base is the
+  right model for this endpoint. No change recommended.
+- **`/generate/i2v`** is currently a stub (returns 501) precisely because
+  if/when we wire i2v, the maintainer's own steer is to use TenStrip's
+  10Eros merge rather than Sulphur-2-base for that path. Sulphur-2-base
+  will *work* for i2v (LTX-2.3 base supports it natively, Sulphur's
+  shipped `ltx23_i2v distilled.json` workflow exercises it), but the
+  10Eros merge produces materially better results per the maintainer's
+  guidance. Adding i2v would mean a separate model download + a separate
+  workflow configuration, not a flag-flip on the existing path.
+
+We do not claim i2v is Sulphur-2-base's primary intended use. Our
+deployment fits Sulphur's strongest path.
+
 ## Architecture
 
 ```
@@ -339,7 +374,7 @@ whose message says "version 1.4.0", 2026-05-05), which is downstream of
 ```
 solphur2_setup/
 ├── README.md                    this file
-├── LICENSE                      MIT for the orchestration; models keep their upstream licenses
+├── LICENSE                      Unlicense (public domain); upstream models keep their own licenses
 ├── versions.env                 single source of truth for every pin
 ├── docker-compose.yml           three services, 127.0.0.1 only
 ├── api/
@@ -387,7 +422,23 @@ Lightricks' canonical LTX-2.3 two-stage distilled example:
 
 ## License
 
-This project's orchestration code is MIT licensed. The Sulphur-2-base model
-(SulphurAI), LTX-2.3 (Lightricks), and Gemma3 (Google) all carry their own
-upstream licenses — see each repo's `LICENSE.txt`. SulphurAI's model is
-described by its author as "uncensored" — operate accordingly.
+This project's orchestration code is released under
+[The Unlicense](https://unlicense.org/) — public domain, do anything you
+want with it. See `LICENSE` for the canonical text.
+
+The bundled and downloaded models retain their own upstream licenses,
+which are NOT public domain:
+
+- `SulphurAI/Sulphur-2-base` — see the SulphurAI HF repo. The author
+  describes it as *"uncensored"*; operate accordingly.
+- `Lightricks/LTX-2.3` (base architecture + spatial upscaler) — see the
+  Lightricks HF repo.
+- `Comfy-Org/ltx-2` Gemma3 text encoder — derived from Google's Gemma 3
+  weights; subject to Google's Gemma license.
+- TenStrip's `fro90_ceil72_condsafe` distill LoRA — see TenStrip's HF
+  repo for its license.
+- Unsloth-quantized Qwen 3.5-9B + qwen3vl_merger mmproj (the prompt
+  enhancer) — Apache-2.0 upstream; see Qwen and Unsloth model cards.
+
+Public-domain license on this orchestration code does NOT grant any
+rights to the model weights it operates on.
