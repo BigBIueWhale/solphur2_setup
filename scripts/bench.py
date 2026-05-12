@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-scripts/bench.py — Binary-search the solphur2 quality/VRAM envelope.
+scripts/bench.py — Sweep the solphur2 quality/VRAM envelope.
 
 The "max-quality knob" question on a 32 GiB RTX 5090 is: where exactly do
-we cross the VRAM line? This script systematically probes (resolution,
-duration, mode, step-count) tuples and records (peak VRAM, wall-clock,
-output filesize, exit status) per attempt.
+we cross the VRAM line? This script walks an opinionated 9-step linear
+list of (resolution, duration, fps, mode) tuples and records (peak VRAM,
+wall-clock, output filesize, exit status) per attempt.
 
 Usage:
     python3 scripts/bench.py                          # run the default sweep
@@ -16,11 +16,15 @@ Usage:
 Output: JSON Lines at <output-dir>/bench-YYYYMMDD-HHMMSS.jsonl, plus a
 summary table at the end.
 
-The sweep is structured as a binary search over the (resolution × duration)
-plane in `fast` mode, then a follow-up confirmation in `quality` mode at the
-largest known-good config. A run that returns HTTP 5xx or whose peak VRAM
-exceeds 32500 MiB (within 100 MiB of the card's 32607 MiB ceiling) is treated
-as failure and the search backs off.
+The sweep is a STATIC ordered list, not an adaptive search. Run #1 is
+the validated HEADLINE (1280×704 × 10 s × quality) so `--max-runs 1`
+gives a successful highest-fidelity measurement; runs #2-#6 walk the
+fast-mode envelope up to the LTX-2.3 ceiling; run #7 is the known-broken
+1080p × 20 s × quality (reproduces avcodec EINVAL — kept as a regression
+detector); runs #8-#9 push past the documented ceiling. A run that
+exceeds 32500 MiB peak VRAM (within 100 MiB of the card's 32607 MiB
+ceiling) or returns HTTP 5xx is recorded as failure but does NOT alter
+subsequent runs — the list is static.
 
 Dependencies: the standard library only (urllib, json, subprocess). Run from
 the project root with the stack already up (scripts/up.sh).
@@ -139,28 +143,37 @@ def execute_one(prompt: str, run: Run, output_dir: Path) -> Run:
 
 
 def sweep_config(max_runs: int) -> list[Run]:
-    """The opinionated sweep order. Tries the cheapest valid config first
-    so we can prove the stack works before stressing it, then walks toward
-    the documented ceiling."""
+    """The opinionated sweep order — VALIDATED HEADLINE FIRST.
+
+    Run #1 is the highest-fidelity config validated to work end-to-end
+    (1280×704 × 10 s × quality), so `python3 scripts/bench.py --max-runs 1`
+    produces a successful headline measurement. Subsequent runs walk the
+    fast-mode envelope up to the LTX-2.3 ceiling. The 1920×1088 × 20 s ×
+    quality run is deliberately placed late in the sweep because it
+    REPRODUCES a known audio-mux EINVAL failure — useful for capturing
+    the bug, but not as the lead measurement.
+    """
     seed = 4242
     runs = [
-        # 1. cheapest smoke: 5 s @ 720p, fast
-        Run(1280, 704, 5.0, 24, "fast", seed),
-        # 2. 10 s @ 720p
+        # 1. HEADLINE — Sulphur's tested envelope × quality (upstream-canonical refine).
+        Run(1280, 704, 10.0, 24, "quality", seed),
+        # 2. Same envelope × fast — speed-optimised distilled recipe.
         Run(1280, 704, 10.0, 24, "fast", seed),
-        # 3. 20 s @ 720p — bmgjet-equivalent at the lower bound
+        # 3. 720p × 20 s × fast — full duration at the safe-megapixel resolution.
         Run(1280, 704, 20.0, 24, "fast", seed),
-        # 4. 5 s @ 1080p — half-length test before the headline target
-        Run(1920, 1088, 5.0, 24, "fast", seed),
-        # 5. 10 s @ 1080p — Sulphur's shipped default duration
+        # 4. 720p × 5 s × fast — cheap regression-guard smoke.
+        Run(1280, 704, 5.0, 24, "fast", seed),
+        # 5. 1080p × 10 s × fast — full resolution within typical duration.
         Run(1920, 1088, 10.0, 24, "fast", seed),
-        # 6. THE HEADLINE: 20 s @ 1080p, fast
+        # 6. 1080p × 20 s × fast — LTX-2.3 ceiling at the speed recipe (largest known-working).
         Run(1920, 1088, 20.0, 24, "fast", seed),
-        # 7. 20 s @ 1080p, quality mode — same VRAM, ~30 min
+        # 7. 1080p × 20 s × quality — KNOWN-FAILS at SaveVideo audio mux (avcodec EINVAL).
+        #    Kept in the sweep to detect if upstream ever fixes the audio-VAE
+        #    amplitude drift at the longer / higher-res latent.
         Run(1920, 1088, 20.0, 24, "quality", seed),
-        # 8. push past the documented Fast ceiling: 1440p × 10 s
+        # 8. push past the documented ceiling: 1440p × 10 s.
         Run(1440, 800, 10.0, 24, "fast", seed),
-        # 9. brave attempt: 4K × 10 s, fast — expected to OOM via 3-stage
+        # 9. brave attempt: 4K × 10 s — expected to OOM.
         Run(3840, 2176, 10.0, 24, "fast", seed),
     ]
     return runs[: max_runs or len(runs)]

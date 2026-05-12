@@ -17,16 +17,24 @@ Endpoints:
 Each /generate POST returns exactly one MP4 (Content-Type: video/mp4).
 Atomic single-file response — no streaming, no multipart out.
 
-Hardware ceiling assumptions (validated 2026-05-11 on RTX 5090 sm_120, 32607 MiB):
-  • 1920x1088 × 481 frames @ 24 fps via Sulphur FP8 mixed + per-stage distill
-    LoRA peaks at ~26.2 GiB VRAM, ~7 min wall-clock (measured 433s on Test A).
-    The canonical two-stage
-    pipeline (half-resolution base at 960×544 → x2-spatial-upsample → refine)
-    is what keeps the activation footprint manageable; the wide gap from the
-    32.6 GiB ceiling leaves room for the FP16-SageAttention / BF16-Gemma3
-    quality lifts when those land.
-  • "quality" mode (no distill LoRA, 50-step LTXVScheduler) runs the full
-    non-distilled Sulphur dev model at the same VRAM peak, ~14 min (measured 853s on RTX 5090 Test B).
+Hardware ceiling assumptions (validated 2026-05-12 on RTX 5090 sm_120, 32607 MiB):
+  • DEFAULT config (1280×704 × 241 frames @ 24 fps, quality mode,
+    upstream-canonical recipe = 5-step stage-2 sigmas + cond_safe distill
+    at stage 2 only). Fresh-stack cold-start measurement: 188 s
+    wall-clock, 31 795 MiB VRAM peak (97.5%), 607 W peak, 53 726 MiB
+    concurrent stack RAM peak. Warm-cache subsequent requests: 169 s,
+    32 095 MiB, 48 799 MiB stack RAM. The canonical two-stage pipeline
+    (half-resolution base at 640×352 → x2-spatial-upsample → 5-step
+    refine with cond_safe @ 0.5) keeps activations within the 32 GiB envelope.
+  • LTX-2.3 ceiling 1920×1088 × 20 s at mode=fast: 445 s wall-clock,
+    31 713 MiB VRAM peak (97.3%), 607 W peak, 57 949 MiB stack RAM peak.
+    Largest known-working envelope.
+  • LTX-2.3 ceiling 1920×1088 × 20 s at mode=quality is a KNOWN FAILURE:
+    the SaveVideo audio mux rejects the encoded audio with
+    avcodec_send_frame() EINVAL after ~1080 s of compute. The bug is
+    independent of stage-2 distill stacking (verified with control
+    runs); the most likely cause is audio-VAE amplitude drift at the
+    longer / higher-resolution latent.
   • The full 20-second / 24 fps / 1080p envelope is Lightricks' documented max
     for LTX-2.3 (arXiv:2601.03233 §6.3; docs.ltx.video/models).
 """
@@ -58,15 +66,22 @@ OUTPUTS_DIR = Path(os.environ.get("OUTPUTS_DIR", "/outputs"))
 SULPHUR_CKPT = "sulphur_dev_fp8mixed.safetensors"
 DISTILL_LORA = "ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors"
 SPATIAL_UPSCALER = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
-GEMMA3_TEXT_ENCODER = "gemma_3_12B_it_fp8_scaled.safetensors"  # FP8-scaled; BF16 deferred — Test C crashed at FFmpeg audio mux on BF16
+GEMMA3_TEXT_ENCODER = "gemma_3_12B_it_fp8_scaled.safetensors"  # FP8-scaled (Comfy-Org/ltx-2 split_files); BF16 variant deferred — caused FFmpeg audio mux failure in an early bench, not captured to bench_runs/
 
-# Per-stage distill LoRA strengths — Sulphur-canonical.
-# Sulphur applies the distill LoRA at 0.7 on stage 1 and 0.5 on stage 2.
-# TenStrip's README for the `cond_safe` LoRA family says these strengths are
-# safe ("1.0 first pass i2v / 0.4–0.5 upscale pass"); Sulphur uses 0.7 on
-# stage 1 because it also stacks an additional Sulphur LoRA in its native
-# workflow. We use a single LoRA (the full Sulphur model carries the fine-
-# tune in weights), so 0.7 stage 1 is conservative-but-faithful.
+# Per-stage distill LoRA strengths — Sulphur-canonical, verbatim from
+# upstream workflows. Stage-2 (0.5) is applied in BOTH quality and fast
+# modes; stage-1 (0.7) is applied only in fast mode.
+#
+# Verified 2026-05-12 against upstream Sulphur workflows:
+#   - ltx23_t2v distilled.json: stage-1 LoRA node 59 strength 0.7 (mode 0,
+#     active); stage-2 LoRA node 49 strength 0.5 (mode 0, active).
+#   - ltx23_t2v base.json: stage-1 LoRA node 59 strength 0.4 (mode 4,
+#     BYPASSED — i.e. quality mode skips stage-1 distill); stage-2 LoRA
+#     node 49 strength 0.5 (mode 0, ACTIVE).
+#
+# TenStrip's `cond_safe` README describes these strengths as designed-in:
+# "1.0 first pass i2v / 0.4-0.5 upscale pass." 0.5 at stage-2 (the upscale
+# pass) is the canonical operating point for the cond_safe LoRA family.
 DISTILL_LORA_STRENGTH_STAGE1 = 0.7
 DISTILL_LORA_STRENGTH_STAGE2 = 0.5
 
@@ -82,10 +97,26 @@ STAGE1_SIGMAS_FAST = (
     "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
 )
 
-# Stage-2 sigmas for "fast" mode — both Sulphur's shipped workflow (connected
-# nodes #7) AND Lightricks' canonical two-stage distilled example agree on
-# exactly these 4 values. 4 sigma values = 3 active refinement steps.
+# Stage-2 sigmas — DIFFER between fast and quality modes (split 2026-05-12).
+#
+# Fast mode uses the 4-value (3-step) schedule from Sulphur's
+# `workflows/ltx23_t2v distilled.json` (ManualSigmas node id=7, the actively-
+# wired stage-2 schedule there). Designed to ride with the distill LoRA at
+# stage 2 — 3 steps suffice because each consistency-distilled step
+# approximates a multi-step trajectory.
+#
+# Quality mode uses the 6-value (5-step) schedule from Sulphur's
+# `workflows/ltx23_t2v base.json` (ManualSigmas node id=58, the actively-
+# wired stage-2 schedule there). Designed for non-distilled refinement —
+# more steps because each step does the work of one diffusion ODE update
+# rather than a distilled-trajectory shortcut.
+#
+# Note: `0.85, 0.7250, 0.4219, 0.0` ALSO appears in `ltx23_t2v base.json`
+# as ManualSigmas node id=7, but its `links` list is empty (orphan). It
+# was a copy-paste artifact from the distilled workflow. The wired stage-2
+# schedule in the base workflow is node id=58 (the 5-step value).
 STAGE2_SIGMAS_FAST = "0.85, 0.7250, 0.4219, 0.0"
+STAGE2_SIGMAS_QUALITY = "0.85, 0.7933, 0.68, 0.51, 0.2833, 0.0"
 
 # "Quality" mode = Sulphur's non-distilled BASE workflow (ltx23_t2v base.json):
 # LTXVScheduler(50 steps, max_shift=2.72, base_shift=0.8, stretch=true,
@@ -168,17 +199,17 @@ def _build_workflow(
         20 EmptyLTXVLatentVideo
         21 LTXVEmptyLatentAudio
         22 LTXVConcatAVLatent (joins video + audio token streams)
-        30 KSamplerSelect (euler_cfg_pp — deterministic stage-1)
-        31 ManualSigmas
+        30 KSamplerSelect (euler_ancestral_cfg_pp [fast] or euler_ancestral [quality] — stage-1)
+        31 ManualSigmas [fast] or LTXVScheduler [quality]
         32 RandomNoise
-        33 CFGGuider (cfg=1.0)
+        33 CFGGuider (cfg=1.0 [fast] or 3.6 [quality])
         34 SamplerCustomAdvanced → LATENT (AV-concat)
 
       Stage-2 latent prep + sampling (after spatial x2 upscaling of VIDEO ONLY):
         35 LTXVSeparateAVLatent (split stage-1 output)
         40 LTXVLatentUpsampler (video latent + vae + upscale_model) → LATENT
         36 LTXVConcatAVLatent (upsampled video + stage-1 audio) → LATENT
-        41 KSamplerSelect (euler_ancestral_cfg_pp — stochastic refine)
+        41 KSamplerSelect (euler_cfg_pp — stage-2 refine, both modes)
         42 ManualSigmas
         43 RandomNoise (seed+1)
         44 CFGGuider (cfg=1.0)
@@ -235,25 +266,28 @@ def _build_workflow(
         "Patch SageAttention",
     )
 
-    # Per-stage distill-LoRA strengths — fast mode only.
+    # Stage-1 / stage-2 distill LoRA wiring — both modes apply at least the
+    # stage-2 LoRA at 0.5, matching upstream Sulphur ltx23_t2v base.json
+    # node 49 (mode: 0, active even in "base" non-distilled mode). Fast mode
+    # additionally applies the stage-1 LoRA at 0.7, matching ltx23_t2v
+    # distilled.json node 59 (and base.json node 59, which is mode: 4 /
+    # bypassed in "base" mode).
     #
-    # The distill LoRA is applied ONLY in "fast" mode at Sulphur's per-stage
-    # strengths 0.7 stage 1 / 0.5 stage 2 (matching `sulphur_workflow.json`
-    # and TenStrip's `fro90_ceil72_condsafe` README guidance).
-    #
-    # In "quality" mode the distill LoRA is INTENTIONALLY OMITTED, even though
-    # Sulphur's shipped non-distilled base workflow (`ltx23_t2v base.json`)
-    # applies it at 0.5/0.5. The reason for our deviation is empirical:
-    # we use the full Sulphur FP8-mixed model (`sulphur_dev_fp8mixed.safetensors`)
-    # as the base, whereas Sulphur's base workflow uses LTX-2.3-base PLUS
-    # `sulphur_final.safetensors` as a separate LoRA. The maintainer's README
-    # explicitly warns: "use the lora or use the full models, don't use both at
-    # the same time." Stacking the distill LoRA on top of the full Sulphur
-    # model in 50-step LTXVScheduler + CFG=3.6 mode produced an
-    # avcodec_send_frame() EINVAL failure at the SaveVideo audio encoder
-    # (the audio VAE output goes outside FFmpeg's acceptable amplitude range).
-    # Without the distill LoRA in quality mode, audio encodes correctly and
-    # visual quality is high (Test B baseline).
+    # History note (resolved 2026-05-12):
+    # An earlier code revision omitted the stage-2 LoRA in quality mode on
+    # the theory that stacking it on the fused Sulphur checkpoint caused an
+    # avcodec_send_frame() EINVAL at the audio mux. After the Blackwell-
+    # stability swaps (Gemma fp8_scaled, SageAttention pv_fp16_cuda) and
+    # the 5-step stage-2 sigma fix (upstream node 58 vs the orphan node 7),
+    # the EINVAL stopped reproducing at the DEFAULT 1280×704 × 10 s
+    # envelope. It still fires at the LTX-2.3 ceiling 1920×1088 × 20 s
+    # × quality — but a control measurement with the stage-2 LoRA OMITTED
+    # at the same envelope hit the IDENTICAL EINVAL, so stage-2 distill is
+    # innocent. The OOD-envelope failure is unrelated to LoRA stacking
+    # (almost certainly audio-VAE amplitude drift at the longer latent).
+    # Stage-2 distill is therefore kept unconditionally at 0.5 —
+    # upstream-canonical AND empirically safe at every envelope where the
+    # larger system works.
     if apply_distill_lora:
         add(
             3,
@@ -265,23 +299,23 @@ def _build_workflow(
             },
             "Distill LoRA (Stage 1)",
         )
-        add(
-            7,
-            "LoraLoaderModelOnly",
-            {
-                "model": ref(2, 0),
-                "lora_name": DISTILL_LORA,
-                "strength_model": DISTILL_LORA_STRENGTH_STAGE2,
-            },
-            "Distill LoRA (Stage 2)",
-        )
         model_stage1 = ref(3, 0)
-        model_stage2 = ref(7, 0)
     else:
-        # Quality mode: no distill LoRA — see comment above for empirical
-        # rationale. Same model object feeds both stage-1 and stage-2 guiders.
         model_stage1 = ref(2, 0)
-        model_stage2 = ref(2, 0)
+    # Stage-2 distill is applied in BOTH modes (matches upstream base.json
+    # node 49 mode: 0). Strength 0.5 in both — TenStrip's cond_safe README
+    # explicitly recommends "0.5 upscale pass" for this LoRA family.
+    add(
+        7,
+        "LoraLoaderModelOnly",
+        {
+            "model": ref(2, 0),
+            "lora_name": DISTILL_LORA,
+            "strength_model": DISTILL_LORA_STRENGTH_STAGE2,
+        },
+        "Distill LoRA (Stage 2)",
+    )
+    model_stage2 = ref(7, 0)
 
     # LTXAVTextEncoderLoader fuses the Gemma3 text encoder with the LTX-2.3
     # checkpoint so cross-attention is wired correctly. Both filenames required.
@@ -483,28 +517,35 @@ def _build_workflow(
     )
 
     # ---- Stage-2 sampling ---------------------------------------------------
-    # Stage-2 is canonical for both fast and quality modes:
+    # Stage-2 parameters:
     #   sampler        = euler_cfg_pp        (Lightricks two-stage example;
-    #                                          Sulphur ships `lcm` here but we
-    #                                          reject lcm — it's noise-prediction
-    #                                          paradigm, LTX-2 is flow-matching)
-    #   sigmas         = ManualSigmas "0.85, 0.7250, 0.4219, 0.0"
-    #                    (both Sulphur AND Lightricks agree)
-    #   cfg            = 1.0                  (both authorities)
-    #   refresh seed   = fixed value seed+1   (deterministic refine)
+    #                                          Sulphur ships `lcm` here but
+    #                                          `lcm` is consistency-distilled
+    #                                          paradigm — the right partner
+    #                                          for `lcm` is the distill LoRA
+    #                                          active at stage 2, which we
+    #                                          omit in quality mode)
+    #   sigmas         = MODE-DEPENDENT:
+    #                    fast    = STAGE2_SIGMAS_FAST    (3 steps, distilled)
+    #                    quality = STAGE2_SIGMAS_QUALITY (5 steps, non-distilled,
+    #                              from upstream ltx23_t2v base.json node 58)
+    #   cfg            = 1.0                  (both modes)
+    #   refresh seed   = caller_seed + 1     (deterministic refine)
     add(41, "KSamplerSelect", {"sampler_name": "euler_cfg_pp"}, "Sampler 2")
-    add(42, "ManualSigmas", {"sigmas": STAGE2_SIGMAS_FAST}, "Sigmas 2")
+    stage2_sigmas = STAGE2_SIGMAS_FAST if apply_distill_lora else STAGE2_SIGMAS_QUALITY
+    add(42, "ManualSigmas", {"sigmas": stage2_sigmas}, "Sigmas 2")
     # Stage-2 noise seed: caller_seed + 1.
     # Sulphur's shipped workflows hardcode a fixed `42` here, and Lightricks'
     # two-stage example does the same. Empirically, switching to fixed=42 in
     # our pipeline (full Sulphur FP8 model + Lightricks canonical samplers)
-    # coincided with an avcodec_send_frame() EINVAL audio-encoder failure
-    # at the SaveVideo node. seed+1 — used in Test B (proven-working
-    # configuration) — keeps stage 2's noise derived from the caller seed and
-    # the audio path stable. The maintainer's hardcoded 42 in their shipped
-    # workflow is tied to their LTX-2.3-base + sulphur_final LoRA recipe, not
-    # ours. Future investigation could bisect why fixed=42 specifically broke
-    # audio; for now, seed+1 is the validated value.
+    # coincided with an avcodec_send_frame() EINVAL audio-encoder failure at
+    # the SaveVideo node. seed+1 — the configuration that produced the
+    # currently-archived working measurement in bench_runs/ — keeps stage 2's
+    # noise derived from the caller seed and the audio path stable. The
+    # maintainer's hardcoded 42 in their shipped workflow is tied to their
+    # LTX-2.3-base + sulphur_final LoRA recipe, not ours. Future
+    # investigation could bisect why fixed=42 specifically broke audio
+    # (task #28 would capture the EINVAL reproduction).
     add(43, "RandomNoise", {"noise_seed": int(seed) + 1}, "Noise 2")
     add(
         44,
@@ -658,16 +699,22 @@ class GenerateRequest(BaseModel):
         "quality",
         pattern="^(fast|quality)$",
         description=(
-            "quality = Sulphur's non-distilled base config (50-step "
-            "LTXVScheduler + euler_ancestral + CFG=3.6 stage 1, 3-step refine "
-            "stage 2). Same Sulphur FP8 mixed weights, same VRAM peak (~30 "
-            "GiB), ~14 min (measured 853s on RTX 5090 Test B) on RTX 5090. This is the DEFAULT — quality is "
-            "the headline target. "
-            "fast    = Sulphur's distilled config with TenStrip's "
+            "quality = Sulphur's `ltx23_t2v base.json` recipe (50-step "
+            "LTXVScheduler + euler_ancestral + CFG=3.6 stage 1, NO stage-1 "
+            "distill LoRA; 5-step refine stage 2 with cond_safe distill "
+            "LoRA @ 0.5). At the default "
+            "1280×704 × 10 s envelope this measures 188 s wall-clock and "
+            "31 795 MiB VRAM peak on RTX 5090 from a fresh-stack cold "
+            "start (169 s / 32 095 MiB warm-cache), validated 2026-05-12. "
+            "This is the "
+            "DEFAULT — quality is the headline target. "
+            "fast = Sulphur's distilled config with TenStrip's "
             "fro90_ceil72_condsafe LoRA at strengths 0.7+0.5 + 8-step "
-            "DISTILLED_SIGMA_VALUES + euler_ancestral_cfg_pp. Same VRAM, "
-            "~7 min on RTX 5090 (measured 433s). Opt in by passing mode='fast' for fast "
-            "iteration / preview."
+            "DISTILLED_SIGMA_VALUES + euler_ancestral_cfg_pp. Opt in by "
+            "passing mode='fast' for fast iteration / preview. Fast-mode "
+            "wall-clock + VRAM at the same default envelope is not yet "
+            "captured to bench_runs/; 1080p × 20 s for either mode is "
+            "projected from the architecture, not measured."
         ),
     )
     enhance_prompt: bool = Field(
@@ -958,7 +1005,7 @@ async def generate(req: GenerateRequest) -> FileResponse:
     client_id = uuid.uuid4().hex
 
     # Per-phase wall-clock timing. Each phase is logged and surfaced in
-    # the response headers so a caller (or scripts/measure_default.sh)
+    # the response headers so a caller (or scripts/measure.sh)
     # can plot the timeline without re-instrumenting. All three phases
     # are measured even when one is skipped (enhance_seconds == 0.0 when
     # enhance_prompt=False) so the header schema is stable.

@@ -1,33 +1,55 @@
 #!/usr/bin/env bash
-# scripts/measure_default.sh — rebuild the API image, then measure peak
-# VRAM, peak per-container RAM, and per-phase wall-clock for ONE
-# default-config generation.
+# scripts/measure.sh — instrument ONE /generate request end-to-end:
+# rebuild if needed, sample nvidia-smi + cgroup v2 + /proc at 1 Hz, write
+# the resulting MP4 + headers + CSVs + a human-readable summary under
+# bench_runs/.
+#
+# DEFAULT BEHAVIOUR is the **highest-fidelity config that's empirically
+# validated to work end-to-end** — i.e. the Sulphur-tested envelope at
+# quality mode: `1280 × 704 × 10 s × 24 fps × mode=quality`. This is what
+# the README's headline wall-clock + VRAM numbers come from.
+#
+# Why not default to the LTX-2.3 ceiling (1920×1088 × 20 s × quality)?
+# Empirically that envelope reproduces an `avcodec_send_frame() returned
+# 22` (EINVAL) failure at the SaveVideo audio mux. The bug is independent
+# of stage-2 distill LoRA stacking (control runs with both wirings fail
+# identically) and is presumed to be audio-VAE amplitude drift at the
+# longer / higher-resolution latent. Until that's fixed, the highest-
+# quality validated envelope is the Sulphur-tested 1280×704 × 10 s.
+# Override flags let you measure other envelopes — use
+# `--ltx-ceiling-fast` for 1080p × 20 s in fast mode (the largest known-
+# working envelope) or `--ltx-ceiling-quality` to reproduce the EINVAL
+# bug capture locally.
 #
 # Why this exists separately from scripts/test.sh and scripts/bench.py:
-#   • scripts/test.sh runs functional smoke/headline tests with hard-coded
-#     (and non-default) parameters (720p×5s + 1080p×20s), no monitoring.
-#   • scripts/bench.py sweeps the (resolution × duration) envelope and only
-#     samples VRAM (no RAM, no per-phase split, prompt enhancer disabled).
-#   • This script measures EXACTLY the server-side defaults a normal API
-#     caller hits: 1280×704 × 10s × 24fps × mode=quality × enhance_prompt=true.
-#     Those are the headline numbers the README documents.
+#   • scripts/test.sh runs functional pass/fail smoke + headline tests; no
+#     telemetry capture.
+#   • scripts/bench.py sweeps the (resolution × duration × mode) envelope
+#     across multiple runs; only samples VRAM (no RAM, no per-phase split,
+#     enhancer disabled).
+#   • This script measures EXACTLY ONE config — with the prompt enhancer
+#     active, per-phase wall-clock split, all GPU telemetry, and per-
+#     container CPU+RAM — and writes everything to a timestamped subdir.
 #
 # Steps (each delegated — no duplicated docker/compose commands here):
 #   1. scripts/build.sh                  → rebuild images (layer cache; the
 #                                           API image rebuilds quickly when
 #                                           api/server.py changes).
-#   2. docker compose up -d              → apply the new API image.
+#   2. docker compose up -d              → apply any new image.
 #   3. wait for /healthz                 → don't measure during startup.
 #   4. sample nvidia-smi + cgroup v2     → 1 s cadence, background.
-#   5. POST /generate                    → minimal body, server defaults.
+#   5. POST /generate                    → at the requested envelope.
 #   6. aggregate peaks                   → from CSVs.
 #   7. print summary                     → including the per-phase X-Solphur2
 #                                           headers the API returned.
 #
 # Usage:
-#     bash scripts/measure_default.sh "<prompt>"                       # rebuild + measure
-#     bash scripts/measure_default.sh "<prompt>" --skip-build          # skip the rebuild
-#     bash scripts/measure_default.sh "<prompt>" --no-cache            # full rebuild from scratch
+#     bash scripts/measure.sh "<prompt>"                          # 1280×704 × 10 s × quality (highest validated)
+#     bash scripts/measure.sh "<prompt>" --skip-build             # same, reuse current images
+#     bash scripts/measure.sh "<prompt>" --ltx-ceiling-fast       # 1920×1088 × 20 s × fast (largest known-working envelope)
+#     bash scripts/measure.sh "<prompt>" --ltx-ceiling-quality    # 1920×1088 × 20 s × quality (KNOWN FAILURE; captures the EINVAL)
+#     bash scripts/measure.sh "<prompt>" --width 1280 --height 704 --duration 10 --mode quality
+#     bash scripts/measure.sh "<prompt>" --seed 42 --no-enhance   # deterministic, skip enhancer
 #
 # The prompt is a REQUIRED positional argument — there is intentionally no
 # default. Defaulting would either ship a SFW prompt (silently bypassing
@@ -36,14 +58,15 @@
 # they're measuring.
 #
 # Example:
-#     bash scripts/measure_default.sh \
+#     bash scripts/measure.sh \
 #         "a beautiful nude woman lying on satin sheets, soft golden light, slow cinematic tracking camera, 35mm"
 #
-# Output: ./bench_runs/measure_default_YYYYMMDD-HHMMSS/
+# Output: ./bench_runs/measure_<W>x<H>_<DUR>s_<MODE>_YYYYMMDD-HHMMSS/
 #   ├── run.mp4                           → the generated video
 #   ├── headers.txt                       → all X-Solphur2-* response headers
 #   ├── gpu.csv                           → 1s-cadence nvidia-smi
 #   ├── ram.csv                           → 1s-cadence cgroup v2 (memory.current + cpu.stat)
+#   ├── host.csv                          → 1s-cadence host CPU + RAM via /proc
 #   ├── api.log                           → solphur2-api docker logs (phase lines)
 #   └── summary.txt                       → human-readable peak/timing table
 
@@ -59,14 +82,29 @@ fail() { printf '[\033[31msolphur2-measure\033[0m %s] %s\n' "$(date +%H:%M:%S)" 
 
 usage() {
     cat >&2 <<EOF
-usage: bash scripts/measure_default.sh "<prompt>" [--skip-build|--no-cache]
+usage: bash scripts/measure.sh "<prompt>" [options]
 
-  <prompt>       REQUIRED positional argument. Free-text prompt for /generate.
-                 No default — see scripts/measure_default.sh header for why.
-  --skip-build   Reuse the current Docker images. Default rebuilds (incremental).
-  --no-cache     Full rebuild from scratch (rare; use when upstream wheels
-                 changed without a version pin bumping).
+  <prompt>            REQUIRED positional argument. Free-text prompt for /generate.
+                      No default — see scripts/measure.sh header for why.
 
+Build control:
+  --skip-build        Reuse the current Docker images. Default rebuilds (incremental).
+  --no-cache          Full rebuild from scratch (rare; use when upstream wheels
+                      changed without a version pin bumping).
+
+Envelope (default = highest validated quality = 1280×704 × 10 s × quality):
+  --ltx-ceiling-fast    Shortcut for 1920×1088 × 20 s × fast (largest envelope
+                        that produces a valid MP4 at the LTX-2.3 ceiling).
+  --ltx-ceiling-quality Shortcut for 1920×1088 × 20 s × quality (KNOWN FAILURE
+                        — reproduces avcodec_send_frame() EINVAL at SaveVideo;
+                        useful only for capturing the bug to bench_runs/).
+  --width N             Override width (server default: 1280).
+  --height N            Override height (server default: 704).
+  --duration N          Override duration in seconds (server default: 10.0).
+  --fps N               Override fps (server default: 24).
+  --mode quality|fast   Override mode (server default: quality).
+  --seed N              Override the per-request random seed (for reproducibility).
+  --no-enhance          Skip the Sulphur prompt enhancer (saves ~25-35 s).
 EOF
     exit 64
 }
@@ -74,12 +112,35 @@ EOF
 PROMPT=""
 DO_BUILD=1
 BUILD_FLAGS=()
+
+# Default envelope = highest validated quality = Sulphur's tested envelope
+# at quality mode. The LTX-2.3 ceiling (1920×1088 × 20 s) currently
+# reproduces an audio-mux EINVAL at quality mode — see the script header
+# for details. `--ltx-ceiling-fast` opts into the largest known-working
+# config.
+WIDTH=1280
+HEIGHT=704
+DURATION=10
+FPS=24
+MODE="quality"
+SEED=""
+ENHANCE_FLAG=""
+
 while (( $# > 0 )); do
     case "$1" in
-        --skip-build)   DO_BUILD=0 ;;
-        --no-cache)     BUILD_FLAGS+=("--no-cache") ;;
-        -h|--help)      usage ;;
-        --*)            echo "unknown flag: $1" >&2; usage ;;
+        --skip-build)            DO_BUILD=0 ;;
+        --no-cache)              BUILD_FLAGS+=("--no-cache") ;;
+        --ltx-ceiling-fast)      WIDTH=1920; HEIGHT=1088; DURATION=20; MODE="fast" ;;
+        --ltx-ceiling-quality)   WIDTH=1920; HEIGHT=1088; DURATION=20; MODE="quality" ;;
+        --width)                 shift; WIDTH="$1" ;;
+        --height)                shift; HEIGHT="$1" ;;
+        --duration)              shift; DURATION="$1" ;;
+        --fps)                   shift; FPS="$1" ;;
+        --mode)                  shift; MODE="$1" ;;
+        --seed)                  shift; SEED="$1" ;;
+        --no-enhance)            ENHANCE_FLAG="--no-enhance" ;;
+        -h|--help)               usage ;;
+        --*)                     echo "unknown flag: $1" >&2; usage ;;
         *)
             if [[ -z "$PROMPT" ]]; then
                 PROMPT="$1"
@@ -95,8 +156,11 @@ done
 [[ -n "$PROMPT" ]] || { echo "error: <prompt> is required." >&2; usage; }
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-OUT_DIR="$REPO_ROOT/bench_runs/measure_default_${STAMP}"
+OUT_DIR="$REPO_ROOT/bench_runs/measure_${WIDTH}x${HEIGHT}_${DURATION}s_${MODE}_${STAMP}"
 mkdir -p "$OUT_DIR"
+
+log "envelope: ${WIDTH}x${HEIGHT} × ${DURATION}s × ${FPS}fps × ${MODE}${SEED:+ × seed=${SEED}}${ENHANCE_FLAG:+ × enhance=off}"
+log "out-dir : $OUT_DIR"
 
 # --- 1. Rebuild images ---------------------------------------------------
 if [[ "$DO_BUILD" -eq 1 ]]; then
@@ -123,49 +187,18 @@ curl -fsS --max-time 3 "$API_URL/healthz" 2>/dev/null | grep -q '"ok":true' \
     || fail "/healthz did not report ok within 5 min; check 'docker compose logs'"
 
 # --- 3. Start the samplers (background) ----------------------------------
-# We sample three things at 1 second cadence for the duration of the request:
-#   • GPU full telemetry via nvidia-smi: memory used/free, compute
-#     utilization %, memory-controller utilization %, power draw W,
-#     SM clock MHz, GPU temperature.
-#   • Per-container RSS + CPU% via `docker stats --no-stream` (one
-#     snapshot per second). All three containers in a fixed column order.
-#   • Host-level CPU + RAM via /proc/stat + /proc/meminfo (free hits the
-#     same kernel counters but parsing one file is fewer fork/exec).
-#
-# Each loop writes one CSV row per second. We capture sampler PIDs so we
-# can kill them precisely (no broad pkill) once the request returns.
-
 GPU_CSV="$OUT_DIR/gpu.csv"
 RAM_CSV="$OUT_DIR/ram.csv"
 HOST_CSV="$OUT_DIR/host.csv"
 
 log "starting samplers (1 s cadence) → gpu.csv, ram.csv, host.csv"
 
-# GPU sampler — nvidia-smi --loop emits one row per interval to stdout.
-# Column order: timestamp, memory.used (MiB), memory.free (MiB),
-# utilization.gpu (%), utilization.memory (%), power.draw (W),
-# clocks.sm (MHz), temperature.gpu (deg C).
 echo "timestamp_iso,gpu_used_mib,gpu_free_mib,util_gpu_pct,util_mem_pct,power_w,clock_sm_mhz,temp_c" > "$GPU_CSV"
 nvidia-smi \
     --query-gpu=timestamp,memory.used,memory.free,utilization.gpu,utilization.memory,power.draw,clocks.sm,temperature.gpu \
     --format=csv,noheader,nounits -lms 1000 >> "$GPU_CSV" 2>&1 &
 GPU_PID=$!
 
-# RAM + CPU sampler — reads cgroup v2 files directly. `docker stats` is
-# too slow (a single snapshot call takes ~2-3 seconds on this host because
-# the daemon round-trip dominates), which produced sparse RAM/CPU CSVs in
-# the first version of this script — RAM was sampled at 0.3 Hz while GPU
-# was at 1 Hz, so transient comfy-load spikes were missed. The cgroup v2
-# files are kernel-maintained and return in microseconds.
-#
-# memory.current : bytes resident (includes file-backed cache, which is
-#                  important because the FP8 safetensors are mmap'd by
-#                  ComfyUI and contribute to the container's RSS).
-# cpu.stat       : has a `usage_usec` line (total CPU microseconds since
-#                  the cgroup was created). Diff between two reads /
-#                  wall-clock-delta gives CPU%.
-
-# Resolve container IDs once; abort cleanly if any container disappeared.
 COMFY_CID="$(docker inspect --format '{{.Id}}' solphur2-comfyui)"
 ENH_CID="$(  docker inspect --format '{{.Id}}' solphur2-enhancer)"
 API_CID="$(  docker inspect --format '{{.Id}}' solphur2-api)"
@@ -182,8 +215,6 @@ done
 
 echo "timestamp_iso,comfyui_mem_mib,comfyui_cpu_pct,enhancer_mem_mib,enhancer_cpu_pct,api_mem_mib,api_cpu_pct" > "$RAM_CSV"
 (
-    # Bootstrap previous-tick CPU usage so the first computed sample is
-    # meaningful (read each cpu.stat twice with a 1 s gap).
     read_cpu_usec() { awk '/^usage_usec/ {print $2; exit}' "$1"; }
     prev_comfy_us=$(read_cpu_usec "$COMFY_CPU")
     prev_enh_us=$(  read_cpu_usec "$ENH_CPU")
@@ -196,13 +227,10 @@ echo "timestamp_iso,comfyui_mem_mib,comfyui_cpu_pct,enhancer_mem_mib,enhancer_cp
         d_ns=$(( now_ns - prev_ns ))
         prev_ns=$now_ns
 
-        # Memory (bytes → MiB, integer truncation).
         comfy_mib=$(( $(<"$COMFY_MEM") / 1048576 ))
         enh_mib=$((   $(<"$ENH_MEM")   / 1048576 ))
         api_mib=$((   $(<"$API_MEM")   / 1048576 ))
 
-        # CPU: usec since cgroup creation. Delta / elapsed-time gives %.
-        # On an N-core box, sum of all cores in use ranges 0..N*100%.
         cur_comfy_us=$(read_cpu_usec "$COMFY_CPU")
         cur_enh_us=$(  read_cpu_usec "$ENH_CPU")
         cur_api_us=$(  read_cpu_usec "$API_CPU")
@@ -212,8 +240,6 @@ echo "timestamp_iso,comfyui_mem_mib,comfyui_cpu_pct,enhancer_mem_mib,enhancer_cp
         prev_comfy_us=$cur_comfy_us
         prev_enh_us=$cur_enh_us
         prev_api_us=$cur_api_us
-        # cpu_pct = (d_us * 1000) / d_ns * 100 = d_us * 100000 / d_ns
-        # awk for the division (bash arithmetic is integer-only).
         cpus_pcts=$(awk -v c="$d_comfy_us" -v e="$d_enh_us" -v a="$d_api_us" -v dn="$d_ns" \
             'BEGIN {
                 if (dn <= 0) { print "0.0,0.0,0.0"; exit }
@@ -231,9 +257,6 @@ echo "timestamp_iso,comfyui_mem_mib,comfyui_cpu_pct,enhancer_mem_mib,enhancer_cp
 ) &
 RAM_PID=$!
 
-# Host sampler — overall CPU% (computed from /proc/stat delta) + RAM
-# (from /proc/meminfo). Useful so we can confirm the system as a whole
-# isn't going into swap or thrashing besides the containers.
 echo "timestamp_iso,host_cpu_pct,host_mem_used_mib,host_mem_avail_mib,host_swap_used_mib" > "$HOST_CSV"
 (
     prev_idle=0; prev_total=0
@@ -271,21 +294,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- 4. Fire one POST /generate at server-side defaults ------------------
-# The actual HTTP request is delegated to scripts/_measure_client.py — see
-# its module docstring for why it's a dedicated Python client rather than
-# inline curl + bash JSON-escaping. The body it constructs contains ONLY
-# the user-supplied prompt; every other parameter falls through to the
-# pydantic defaults in api/server.py:GenerateRequest.
-log "POST $API_URL/generate via scripts/_measure_client.py (server-side defaults)"
+# --- 4. Fire one POST /generate at the requested envelope ----------------
+log "POST $API_URL/generate via scripts/_measure_client.py (envelope: ${WIDTH}x${HEIGHT} × ${DURATION}s × ${MODE})"
 
 T0="$(date +%s)"
 CLIENT_RC=0
-python3 scripts/_measure_client.py \
-    --prompt   "$PROMPT" \
-    --out-dir  "$OUT_DIR" \
-    --api-url  "$API_URL" \
-    --timeout-seconds 1800 || CLIENT_RC=$?
+CLIENT_ARGS=(
+    --prompt          "$PROMPT"
+    --out-dir         "$OUT_DIR"
+    --api-url         "$API_URL"
+    --timeout-seconds 1800
+    --width           "$WIDTH"
+    --height          "$HEIGHT"
+    --duration-seconds "$DURATION"
+    --fps             "$FPS"
+    --mode            "$MODE"
+)
+if [[ -n "$SEED" ]];          then CLIENT_ARGS+=(--seed "$SEED"); fi
+if [[ -n "$ENHANCE_FLAG" ]];  then CLIENT_ARGS+=("$ENHANCE_FLAG"); fi
+python3 scripts/_measure_client.py "${CLIENT_ARGS[@]}" || CLIENT_RC=$?
 T1="$(date +%s)"
 WALL=$(( T1 - T0 ))
 
@@ -298,7 +325,6 @@ if (( CLIENT_RC != 0 )); then
     exit 1
 fi
 
-# Extract HTTP status from the first header line for the summary.
 HTTP=$(awk 'NR==1 {print $2; exit}' "$OUT_DIR/headers.txt")
 [[ "$HTTP" == "200" ]] || fail "expected HTTP 200 in headers; got: $HTTP"
 
@@ -306,9 +332,6 @@ HTTP=$(awk 'NR==1 {print $2; exit}' "$OUT_DIR/headers.txt")
 docker logs --since "$((WALL + 10))s" solphur2-api > "$OUT_DIR/api.log" 2>&1 || true
 
 # --- 6. Aggregate peaks --------------------------------------------------
-# GPU CSV columns (post-header):
-#   1 timestamp_iso, 2 gpu_used_mib, 3 gpu_free_mib, 4 util_gpu_pct,
-#   5 util_mem_pct, 6 power_w, 7 clock_sm_mhz, 8 temp_c
 GPU_PEAK=$(awk -F, 'NR>1 && $2+0 > max {max=$2+0} END {print max+0}' "$GPU_CSV")
 GPU_BASE=$(awk -F, 'NR==2 {print $2+0; exit}' "$GPU_CSV")
 GPU_UTIL_PEAK=$(awk -F, 'NR>1 && $4+0 > max {max=$4+0} END {print max+0}' "$GPU_CSV")
@@ -318,49 +341,42 @@ POWER_AVG=$(   awk -F, 'NR>1 {s+=$6+0; n++} END {if (n>0) printf "%.1f", s/n; el
 CLOCK_PEAK=$(  awk -F, 'NR>1 && $7+0 > max {max=$7+0} END {print max+0}' "$GPU_CSV")
 TEMP_PEAK=$(   awk -F, 'NR>1 && $8+0 > max {max=$8+0} END {print max+0}' "$GPU_CSV")
 
-# RAM CSV columns (post-header):
-#   1 timestamp_iso, 2 comfy_mem, 3 comfy_cpu%, 4 enh_mem, 5 enh_cpu%,
-#   6 api_mem,   7 api_cpu%
 COMFY_PEAK=$(awk -F, 'NR>1 && $2+0 > max {max=$2+0} END {print max+0}' "$RAM_CSV")
 ENH_PEAK=$(  awk -F, 'NR>1 && $4+0 > max {max=$4+0} END {print max+0}' "$RAM_CSV")
 API_PEAK=$(  awk -F, 'NR>1 && $6+0 > max {max=$6+0} END {print max+0}' "$RAM_CSV")
 COMFY_CPU_PEAK=$(awk -F, 'NR>1 && $3+0 > max {max=$3+0} END {printf "%.1f", max+0}' "$RAM_CSV")
 ENH_CPU_PEAK=$(  awk -F, 'NR>1 && $5+0 > max {max=$5+0} END {printf "%.1f", max+0}' "$RAM_CSV")
 API_CPU_PEAK=$(  awk -F, 'NR>1 && $7+0 > max {max=$7+0} END {printf "%.1f", max+0}' "$RAM_CSV")
-# Concurrent maxima — sum of all three container columns per row.
 RAM_STACK_PEAK=$( awk -F, 'NR>1 {s=$2+$4+$6; if (s>max) max=s} END {print max+0}' "$RAM_CSV")
 CPU_STACK_PEAK=$( awk -F, 'NR>1 {s=$3+$5+$7; if (s>max) max=s} END {printf "%.1f", max+0}' "$RAM_CSV")
 
-# Host CSV columns: 1 timestamp_iso, 2 host_cpu%, 3 host_mem_used_mib,
-#   4 host_mem_avail_mib, 5 host_swap_used_mib
 HOST_CPU_PEAK=$(   awk -F, 'NR>1 && $2+0 > max {max=$2+0} END {printf "%.1f", max+0}' "$HOST_CSV")
 HOST_CPU_AVG=$(    awk -F, 'NR>1 {s+=$2+0; n++} END {if (n>0) printf "%.1f", s/n; else print 0}' "$HOST_CSV")
 HOST_MEM_PEAK=$(   awk -F, 'NR>1 && $3+0 > max {max=$3+0} END {print max+0}' "$HOST_CSV")
 HOST_MEM_AVAIL_MIN=$( awk -F, 'NR>1 {if (NR==2 || $4+0 < min) min=$4+0} END {print min+0}' "$HOST_CSV")
 HOST_SWAP_PEAK=$(  awk -F, 'NR>1 && $5+0 > max {max=$5+0} END {print max+0}' "$HOST_CSV")
 
-# Pull per-phase timings out of the response headers.
 PHASE_ENHANCE=$(awk -F': ' 'tolower($1)=="x-solphur2-phaseenhanceseconds"  {print $2}' "$OUT_DIR/headers.txt" | tr -d '\r\n')
 PHASE_SUBMIT=$( awk -F': ' 'tolower($1)=="x-solphur2-phasesubmitseconds"   {print $2}' "$OUT_DIR/headers.txt" | tr -d '\r\n')
 PHASE_COMFY=$(  awk -F': ' 'tolower($1)=="x-solphur2-phasecomfyrunseconds" {print $2}' "$OUT_DIR/headers.txt" | tr -d '\r\n')
 ELAPSED=$(      awk -F': ' 'tolower($1)=="x-solphur2-elapsedseconds"       {print $2}' "$OUT_DIR/headers.txt" | tr -d '\r\n')
-SEED=$(         awk -F': ' 'tolower($1)=="x-solphur2-seed"                 {print $2}' "$OUT_DIR/headers.txt" | tr -d '\r\n')
+SEED_HDR=$(     awk -F': ' 'tolower($1)=="x-solphur2-seed"                 {print $2}' "$OUT_DIR/headers.txt" | tr -d '\r\n')
 RES=$(          awk -F': ' 'tolower($1)=="x-solphur2-resolution"           {print $2}' "$OUT_DIR/headers.txt" | tr -d '\r\n')
 FRAMES=$(       awk -F': ' 'tolower($1)=="x-solphur2-frames"               {print $2}' "$OUT_DIR/headers.txt" | tr -d '\r\n')
-MODE=$(         awk -F': ' 'tolower($1)=="x-solphur2-mode"                 {print $2}' "$OUT_DIR/headers.txt" | tr -d '\r\n')
+MODE_HDR=$(     awk -F': ' 'tolower($1)=="x-solphur2-mode"                 {print $2}' "$OUT_DIR/headers.txt" | tr -d '\r\n')
 
 MP4_SIZE=$(stat -c %s "$OUT_DIR/run.mp4")
 
 # --- 7. Print + persist summary ------------------------------------------
 SUMMARY="$OUT_DIR/summary.txt"
 {
-    echo "solphur2 default-config measurement — ${STAMP}"
+    echo "solphur2 measurement — ${STAMP}"
     echo "==========================================================="
-    echo "Config (server-side defaults; only 'prompt' sent in body):"
+    echo "Config:"
     echo "  resolution  : $RES"
     echo "  frames      : $FRAMES"
-    echo "  mode        : $MODE"
-    echo "  seed        : $SEED"
+    echo "  mode        : $MODE_HDR"
+    echo "  seed        : $SEED_HDR"
     echo "  prompt      : $PROMPT"
     echo
     echo "Wall-clock breakdown (from API response headers):"

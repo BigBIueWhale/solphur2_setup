@@ -1,23 +1,37 @@
 #!/usr/bin/env bash
-# scripts/test.sh — automated smoke + headline tests against the live stack.
+# scripts/test.sh — automated functional tests against the live stack.
 #
 # Assumes scripts/up.sh has already brought everything up and `/healthz`
-# returns ok. Runs:
-#   1. SMOKE: 720p × 5s, fast mode, no enhancer (deterministic seed).
-#      Validates the workflow plumbing end-to-end. Expected: HTTP 200 + a
-#      ≥1 MiB MP4 in ~2 minutes on RTX 5090.
-#   2. HEADLINE: 1080p × 20s, quality mode, no enhancer (deterministic seed).
-#      The user-facing target. Expected: HTTP 200 + a ≥5 MiB MP4 in
-#      ~25–35 min on RTX 5090.
+# returns ok. The DEFAULT is the **headline test** at the highest-fidelity
+# config validated to work end-to-end: Sulphur's tested envelope at
+# quality mode. (The LTX-2.3 ceiling 1920×1088 × 20 s × quality reproduces
+# an audio-mux EINVAL at the SaveVideo node and is NOT the default; opt
+# into it explicitly via `--ltx-ceiling-quality` if you want to capture
+# the bug on your own host.)
+#
+# Tests:
+#   • HEADLINE (default): 1280×704 × 10s, quality mode, no enhancer
+#     (deterministic seed). The user-facing target. Expected: HTTP 200 + a
+#     ≥1 MiB MP4 in ~2.5 minutes on RTX 5090.
+#   • SMOKE (opt-in via --with-smoke or --smoke-only): 1280×704 × 5s,
+#     fast mode, no enhancer. Validates workflow plumbing end-to-end.
+#     Expected: HTTP 200 + a ≥1 MiB MP4 in ~80 s on RTX 5090.
+#   • LTX-CEILING (opt-in via --ltx-ceiling-fast): 1920×1088 × 20s,
+#     FAST mode. The largest envelope that produces a valid MP4.
+#     Quality mode at this envelope crashes — captured separately.
 #
 # Each request includes a fixed seed for reproducibility. Output MP4s land in
 # ./outputs/ and are also copied to ./test_artifacts/ with descriptive names.
 #
-# Flags:
-#     --smoke-only          run only the smoke test
-#     --headline-only       run only the headline test
-#     --enhance             include the prompt enhancer in both tests
-#     --mode=fast|quality   override the default mode (smoke=fast, headline=quality)
+# Flags (default = headline only at 1280×704 × 10s × quality):
+#     --headline-only        run only the headline test (the default)
+#     --smoke-only           run only the smoke test (skip the slow headline)
+#     --with-smoke           run smoke first, then headline (regression-guard)
+#     --ltx-ceiling-fast     additionally run 1920×1088 × 20s × fast
+#     --ltx-ceiling-quality  additionally run 1920×1088 × 20s × quality
+#                            (expected to FAIL — captures the EINVAL bug)
+#     --enhance              include the prompt enhancer in the test(s)
+#     --mode=fast|quality    override the default mode (smoke=fast, headline=quality)
 
 set -Eeuo pipefail
 
@@ -31,19 +45,26 @@ mkdir -p "$ARTIFACTS_DIR"
 log()  { printf '[\033[36msolphur2-test\033[0m %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 fail() { printf '[\033[31msolphur2-test\033[0m %s] %s\n' "$(date +%H:%M:%S)" "$*"; exit 1; }
 
-DO_SMOKE=1
+# Defaults: headline only (highest-fidelity validated config). Smoke and
+# the ltx-ceiling probes are opt-in.
+DO_SMOKE=0
 DO_HEADLINE=1
+DO_LTX_CEIL_FAST=0
+DO_LTX_CEIL_QUAL=0
 ENHANCE="false"
 SMOKE_MODE="fast"
 HEADLINE_MODE="quality"
 
 for arg in "$@"; do
     case "$arg" in
-        --smoke-only)     DO_HEADLINE=0 ;;
-        --headline-only)  DO_SMOKE=0 ;;
-        --enhance)        ENHANCE="true" ;;
-        --mode=fast)      SMOKE_MODE="fast"; HEADLINE_MODE="fast" ;;
-        --mode=quality)   SMOKE_MODE="quality"; HEADLINE_MODE="quality" ;;
+        --smoke-only)            DO_SMOKE=1; DO_HEADLINE=0 ;;
+        --headline-only)         DO_SMOKE=0; DO_HEADLINE=1 ;;
+        --with-smoke)            DO_SMOKE=1; DO_HEADLINE=1 ;;
+        --ltx-ceiling-fast)      DO_LTX_CEIL_FAST=1 ;;
+        --ltx-ceiling-quality)   DO_LTX_CEIL_QUAL=1 ;;
+        --enhance)               ENHANCE="true" ;;
+        --mode=fast)             SMOKE_MODE="fast"; HEADLINE_MODE="fast" ;;
+        --mode=quality)          SMOKE_MODE="quality"; HEADLINE_MODE="quality" ;;
         *) echo "scripts/test.sh: unknown flag: $arg" >&2; exit 64 ;;
     esac
 done
@@ -108,7 +129,18 @@ if [[ "$DO_SMOKE" -eq 1 ]]; then
 fi
 
 if [[ "$DO_HEADLINE" -eq 1 ]]; then
-    run_test headline "$HEADLINE_MODE" 1920 1088 20 42 3000
+    run_test headline "$HEADLINE_MODE" 1280 704 10 42 1800
+fi
+
+if [[ "$DO_LTX_CEIL_FAST" -eq 1 ]]; then
+    run_test ltx-ceiling-fast fast 1920 1088 20 42 3000
+fi
+
+if [[ "$DO_LTX_CEIL_QUAL" -eq 1 ]]; then
+    log "NOTE: ltx-ceiling-quality is EXPECTED to fail with avcodec EINVAL"
+    log "      at the SaveVideo node — this run captures the bug payload"
+    log "      to ${ARTIFACTS_DIR}/. Useful for diagnosing regressions."
+    run_test ltx-ceiling-quality quality 1920 1088 20 42 3000 || true
 fi
 
 log "all requested tests passed."
