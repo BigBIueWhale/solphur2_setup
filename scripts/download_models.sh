@@ -10,7 +10,7 @@
 #     bash scripts/download_models.sh                  # default ./models target
 #     MODELS_DIR=/srv/models bash scripts/download_models.sh
 #
-# Total download: ~58 GiB. With 1 Gbps WAN this takes 10-15 minutes.
+# Total download: ~51 GiB. With 1 Gbps WAN this takes ~10 minutes.
 # Disk space: 60 GiB on the target volume (some staging headroom).
 
 set -Eeuo pipefail

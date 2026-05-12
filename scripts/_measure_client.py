@@ -53,7 +53,7 @@ def main() -> int:
         "--timeout-seconds",
         type=float,
         default=1800.0,
-        help="Read timeout. Default 1800 s comfortably covers quality-mode 1080p×20s.",
+        help="Read timeout. Default 1800 s covers the largest known-working envelope (1920×1088 × 20 s × fast, ~445 s); also long enough to catch the EINVAL crash at 1080p × 20 s × quality (~1080 s).",
     )
 
     # Envelope overrides — only included in the body if explicitly set.

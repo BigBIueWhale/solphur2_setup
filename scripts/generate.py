@@ -20,11 +20,15 @@ Examples
     # Choose the output path:
     python3 scripts/generate.py "..." -o ~/Videos/run.mp4
 
-    # Speed over quality (~7 min vs ~14 min at 1080p × 20 s):
+    # Speed over fidelity (~half wall-clock; adds stage-1 distill LoRA on top
+    # of the stage-2 cond_safe LoRA both modes always apply):
     python3 scripts/generate.py "..." --mode fast
 
-    # Maximum envelope (LTX-2.3 ceiling, logs an OOD-Sulphur warning):
-    python3 scripts/generate.py "..." --width 1920 --height 1088 --duration 20
+    # Maximum envelope at the speed-optimised recipe (LTX-2.3 ceiling, ~445 s):
+    python3 scripts/generate.py "..." --mode fast --width 1920 --height 1088 --duration 20
+
+    # The same envelope at quality mode currently CRASHES with avcodec EINVAL
+    # at the audio mux — known OOD-Sulphur bug, see README "Tuning knobs".
 
     # Reproducible run:
     python3 scripts/generate.py "..." --seed 12345
@@ -189,7 +193,7 @@ def main() -> int:
         "--mode",
         choices=("quality", "fast"),
         default=None,
-        help="Override server-side default (quality). 'fast' = ~half wall-clock, distill LoRA stacked on Sulphur weights.",
+        help="Override server-side default (quality). 'fast' = ~half wall-clock; both modes apply the stage-2 cond_safe distill LoRA at 0.5, 'fast' additionally stacks the stage-1 distill LoRA at 0.7 to collapse the 50-step trajectory to 8 distilled steps.",
     )
     ap.add_argument(
         "--seed",
@@ -227,7 +231,7 @@ def main() -> int:
         dest="enhance",
         action="store_false",
         default=None,
-        help="Skip the Sulphur Qwen3.5-9B prompt enhancer (saves ~34 s; loses descriptive elaboration).",
+        help="Skip the Sulphur Qwen3.5-9B prompt enhancer (saves ~23-30 s; loses descriptive elaboration).",
     )
 
     args = ap.parse_args()
@@ -253,8 +257,9 @@ def main() -> int:
 
     print(
         f"solphur2: POST {args.api_url}/generate "
-        f"(default quality mode at 1280x704x10s typically takes ~2.5 min on RTX 5090; "
-        f"1080p x 20s ~14 min)...",
+        f"(default quality mode at 1280×704 × 10 s takes ~188 s cold-start / "
+        f"~169 s warm-cache on RTX 5090; 1920×1088 × 20 s × fast takes ~445 s; "
+        f"1920×1088 × 20 s × quality currently fails with avcodec EINVAL — known OOD-Sulphur bug)...",
         flush=True,
     )
 

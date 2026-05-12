@@ -5,7 +5,7 @@
 #   • Delete the three solphur2/* Docker images
 #   • Delete every Docker build-cache layer the build produced
 #   • Delete the local ./outputs/ directory (generated MP4s)
-#   • (with --models) ALSO delete the ./models/ directory (~58 GiB of
+#   • (with --models) ALSO delete the ./models/ directory (~51 GiB of
 #     SHA-256-verified safetensors / GGUF; you'll have to re-download).
 #
 # Safe by default — does NOT touch models unless you pass --models.
@@ -50,7 +50,7 @@ fi
 
 if [[ "$WIPE_MODELS" -eq 1 ]]; then
     if [[ -d models ]]; then
-        warn "removing ./models/ — this wipes ~58 GiB of pinned model files;"
+        warn "removing ./models/ — this wipes ~51 GiB of pinned model files;"
         warn "scripts/download_models.sh will re-fetch them on next bring-up."
         rm -rf models
     fi
@@ -62,7 +62,7 @@ fi
 
 log "done."
 if [[ "$WIPE_MODELS" -eq 1 ]]; then
-    log "Next 'scripts/up.sh' will: download ~58 GiB of models AND rebuild all images."
+    log "Next 'scripts/up.sh' will: download ~51 GiB of models AND rebuild all images."
 else
     log "Models preserved. Next 'scripts/up.sh' will only rebuild images."
 fi

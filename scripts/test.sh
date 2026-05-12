@@ -12,7 +12,7 @@
 # Tests:
 #   • HEADLINE (default): 1280×704 × 10s, quality mode, no enhancer
 #     (deterministic seed). The user-facing target. Expected: HTTP 200 + a
-#     ≥1 MiB MP4 in ~2.5 minutes on RTX 5090.
+#     ≥1 MiB MP4 in ~188 s cold-start / ~169 s warm-cache on RTX 5090.
 #   • SMOKE (opt-in via --with-smoke or --smoke-only): 1280×704 × 5s,
 #     fast mode, no enhancer. Validates workflow plumbing end-to-end.
 #     Expected: HTTP 200 + a ≥1 MiB MP4 in ~80 s on RTX 5090.

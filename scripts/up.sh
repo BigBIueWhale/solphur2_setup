@@ -114,11 +114,15 @@ cat <<EOF
   ComfyUI:    http://127.0.0.1:8188/        (debug only)
   Enhancer:   http://127.0.0.1:8080/        (debug only)
 
-  Verify everything works end-to-end (~2 min smoke at 720p × 5s + ~14 min headline at 1080p × 20s):
+  Verify everything works end-to-end at the validated highest-quality envelope
+  (1280×704 × 10 s × quality, ~188 s cold-start / ~169 s warm-cache):
       bash scripts/test.sh
 
-  Smoke only (~2 min):
+  Smoke only (1280×704 × 5 s × fast, ~80 s):
       bash scripts/test.sh --smoke-only
+
+  Also exercise the LTX-2.3 ceiling at the speed-optimised recipe (~445 s):
+      bash scripts/test.sh --ltx-ceiling-fast
 
   Bring everything down (preserves images + models + outputs):
       bash scripts/down.sh
